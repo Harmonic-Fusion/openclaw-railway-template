@@ -124,7 +124,10 @@ A restore gives files a fresh modified time, so the next sync pushes them to R2 
 ```bash
 touch /data/.r2-sync-paused    # pause
 rm /data/.r2-sync-paused       # resume
+r2-sync --resync               # merge both sides again (newest wins)
 ```
+
+If a sync is killed mid-run, the next start drops the leftover bisync lock when that rclone process is gone. `--resync` is also what to run after a filters change. When a sync is already running, the command just asks that process to resync; it does not start a second one.
 
 Set `R2_GIT_REMOTE` to also push snapshots to a private repo, so history survives losing the volume. Changes are captured per sync cycle, not per edit.
 

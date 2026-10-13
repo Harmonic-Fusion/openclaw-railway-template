@@ -21,8 +21,70 @@
 #   R2_GIT_SNAPSHOTS      enable/disable git snapshots (default true)
 #
 # Pause: `touch /data/.r2-sync-paused` (remove the file to resume).
+# Force a merge on the next cycle: `r2-sync --resync` (newest file wins).
+# If a sync is already running, that process does the resync; this one exits.
 
 set -u
+
+usage() {
+  cat <<'EOF'
+usage: r2-sync [--resync] [-h|--help]
+
+Two-way sync between the OpenClaw workspace and a Cloudflare R2 bucket
+(rclone bisync), with git snapshots of the workspace for rollback.
+
+With no arguments, runs until stopped. A sync starts shortly after the
+workspace changes, and at least every R2_SYNC_INTERVAL seconds so edits
+made on the R2 side are pulled down. Does nothing unless R2_BUCKET is set.
+
+Options:
+  --resync    Merge the local workspace and R2 on the next cycle
+              (newest file wins). If a sync is already running, that
+              process does the resync and this command exits.
+  -h, --help  Show this help.
+
+Pause and resume:
+  touch /data/.r2-sync-paused
+  rm /data/.r2-sync-paused
+
+Environment:
+  R2_BUCKET             Bucket name. Required to enable sync.
+  R2_ACCESS_KEY_ID      R2 API token access key. Required.
+  R2_SECRET_ACCESS_KEY  R2 API token secret. Required.
+  R2_ACCOUNT_ID         Cloudflare account id, unless R2_ENDPOINT is set.
+  R2_ENDPOINT           Override the R2 endpoint URL.
+  R2_PREFIX             Optional key prefix inside the bucket.
+  R2_SYNC_INTERVAL      Max seconds between syncs (default 120).
+  R2_SYNC_DEBOUNCE      Quiet period after the last file change, in seconds
+                        (default 5).
+  R2_GIT_SNAPSHOTS      Commit workspace snapshots around each sync
+                        (default true).
+  R2_GIT_REMOTE         Optional private git remote. Snapshots are pushed to it.
+  R2_DATA_DIR           Data directory (default /data).
+  OPENCLAW_STATE_DIR    State directory (default $R2_DATA_DIR/.openclaw).
+  OPENCLAW_WORKSPACE_DIR
+                        Workspace to sync (default $OPENCLAW_STATE_DIR/workspace).
+
+Logs go to stdout and to r2-sync.log in the state directory.
+EOF
+}
+
+FORCE_RESYNC=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --resync) FORCE_RESYNC=1 ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "r2-sync: unknown argument: $1" >&2
+      echo "Try 'r2-sync --help' for more information." >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 if [ -z "${R2_BUCKET:-}" ]; then
   exit 0
@@ -39,6 +101,8 @@ PREFIX="${PREFIX#/}"
 PREFIX="${PREFIX%/}"
 PAUSE_FLAG="$DATA_DIR/.r2-sync-paused"
 WORKDIR="$DATA_DIR/.rclone-bisync"
+PIDFILE="$WORKDIR/r2-sync.pid"
+RESYNC_REQUEST="$WORKDIR/resync-request"
 LOG_FILE="$STATE_DIR/r2-sync.log"
 FILTERS_FILE="$WORKDIR/filters.txt"
 
@@ -85,7 +149,13 @@ export RCLONE_CONFIG_R2_ACL=private
 REMOTE="r2:${R2_BUCKET}"
 [ -n "$PREFIX" ] && REMOTE="${REMOTE}/${PREFIX}"
 
-cat > "$FILTERS_FILE" <<'EOF'
+# Atomic replace, and only when the rules actually change. Rewriting the same
+# bytes still bumps mtime; a partial write would change the filters hash and
+# force a bisync --resync.
+write_filters() {
+  local tmp
+  tmp=$(mktemp "$WORKDIR/filters.XXXXXX")
+  cat > "$tmp" <<'EOF'
 - .git/**
 - node_modules/**
 - .obsidian/**
@@ -94,6 +164,13 @@ cat > "$FILTERS_FILE" <<'EOF'
 - .DS_Store
 - *.tmp
 EOF
+  if [ -f "$FILTERS_FILE" ] && cmp -s "$tmp" "$FILTERS_FILE"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$FILTERS_FILE"
+  fi
+}
+write_filters
 
 # --- git snapshots ----------------------------------------------------------
 
@@ -145,10 +222,79 @@ BISYNC_COMMON=(
   --conflict-loser num
   --resilient
   --recover
+  --max-lock 10m
   --max-delete 25
   --create-empty-src-dirs
   --fast-list
 )
+
+# Lock body is either a bare PID (briefly, at create) or JSON renewed by
+# rclone: {"PID":"123",...}. Default locks never expire, so a killed bisync
+# blocks every later run until the file is removed.
+lock_pid() {
+  local file="$1" pid
+  pid=$(sed -n 's/.*"PID":"\([0-9][0-9]*\)".*/\1/p' "$file" 2>/dev/null | tail -n 1)
+  if [ -z "$pid" ] && grep -qxE '[0-9]+' "$file" 2>/dev/null; then
+    pid=$(tr -cd '0-9' < "$file")
+  fi
+  printf '%s' "$pid"
+}
+
+# Drop a lock whose rclone is gone. A live bisync keeps it.
+# Returns 1 when a bisync is still running.
+release_stale_lock() {
+  local lock pid args locks=()
+  shopt -s nullglob
+  locks=("$WORKDIR"/*.lck)
+  shopt -u nullglob
+  for lock in "${locks[@]}"; do
+    pid=$(lock_pid "$lock")
+    args=""
+    if [ -n "$pid" ]; then
+      args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+    fi
+    case "$args" in
+      *rclone*)
+        case "$args" in
+          *"<defunct>"*) ;;
+          *)
+            log "bisync still running (pid $pid); leaving $(basename "$lock")"
+            return 1
+            ;;
+        esac
+        ;;
+    esac
+    log "removing stale bisync lock $(basename "$lock")"
+    rm -f "$lock"
+  done
+  return 0
+}
+
+# One watchdog per volume. A second `r2-sync --resync` asks the running
+# process to merge on its next cycle instead of starting another bisync.
+claim_singleton() {
+  local old args
+  if [ -f "$PIDFILE" ]; then
+    old=$(tr -cd '0-9' < "$PIDFILE")
+    args=""
+    if [ -n "$old" ] && [ "$old" != "$$" ]; then
+      args=$(ps -p "$old" -o args= 2>/dev/null || true)
+    fi
+    case "$args" in
+      *bin/r2-sync*|r2-sync|r2-sync\ *)
+        if [ "$FORCE_RESYNC" -eq 1 ]; then
+          touch "$RESYNC_REQUEST"
+          log "resync requested; running r2-sync (pid $old) will do it"
+        else
+          log "r2-sync already running (pid $old); exiting"
+        fi
+        exit 0
+        ;;
+    esac
+  fi
+  echo $$ > "$PIDFILE"
+  trap 'rm -f "$PIDFILE"' EXIT
+}
 
 have_listings() {
   ls "$WORKDIR"/*.lst >/dev/null 2>&1
@@ -156,8 +302,11 @@ have_listings() {
 
 run_bisync() {
   local mode="${1:-normal}" out rc
+  if ! release_stale_lock; then
+    return 2
+  fi
   if [ "$mode" = "resync" ]; then
-    log "running initial resync (merging local and R2, newest wins)"
+    log "running resync (merging local and R2, newest wins)"
     out=$(rclone bisync "$WORKSPACE_DIR" "$REMOTE" "${BISYNC_COMMON[@]}" --resync --resync-mode newer 2>&1)
     rc=$?
   else
@@ -175,18 +324,31 @@ sync_cycle() {
     log "paused ($PAUSE_FLAG exists); skipping"
     return 0
   fi
+  if [ -e "$RESYNC_REQUEST" ]; then
+    rm -f "$RESYNC_REQUEST"
+    FORCE_RESYNC=1
+    log "resync requested"
+  fi
 
   git_snapshot "pre-sync"
 
-  if ! have_listings; then
-    run_bisync resync
+  local rc=0
+  if [ "$FORCE_RESYNC" -eq 1 ] || ! have_listings; then
+    run_bisync resync || rc=$?
+    # Keep the request if another bisync still holds the lock.
+    if [ "$rc" -ne 2 ]; then
+      FORCE_RESYNC=0
+    fi
   else
-    run_bisync normal
-    local rc=$?
+    run_bisync normal || rc=$?
     # 7 = critical error requiring --resync (lost state, filter change, ...)
     if [ $rc -eq 7 ]; then
-      run_bisync resync
+      run_bisync resync || rc=$?
     fi
+  fi
+  # 2 = another bisync still holds the lock; try again next cycle.
+  if [ $rc -eq 2 ]; then
+    return 0
   fi
 
   git_snapshot "post-sync"
@@ -246,12 +408,13 @@ wait_for_next_sync() {
   esac
 }
 
+claim_singleton
+git_init
 if [ "$WATCH" -eq 1 ]; then
   log "starting: remote=$REMOTE watching=$WORKSPACE_DIR debounce=${DEBOUNCE}s max-interval=${INTERVAL}s"
 else
   log "starting: remote=$REMOTE interval=${INTERVAL}s workspace=$WORKSPACE_DIR (inotifywait not found)"
 fi
-git_init
 
 while [ "$STOP" -eq 0 ]; do
   rotate_log
