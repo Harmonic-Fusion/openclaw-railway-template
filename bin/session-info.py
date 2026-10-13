@@ -5,6 +5,7 @@ Outputs a summary of the current OpenClaw session including id, model, etc.
 Place in the openclaw template bin folder for easy access.
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -16,7 +17,6 @@ def get_session_info() -> dict:
     info = {
         "timestamp": __import__("datetime").datetime.now().isoformat(),
         "openclawVersion": "unknown",
-        "sessionKey": "unknown",
         "sessionId": "unknown",
         "agentId": "unknown",
         "model": "unknown",
@@ -79,7 +79,6 @@ def get_session_info() -> dict:
                     current_session = running_sessions[0]
 
             if current_session:
-                info["sessionKey"] = current_session.get("key", "unknown")
                 info["sessionId"] = current_session.get("sessionId", "unknown")
                 info["agentId"] = current_session.get("agentId", "unknown")
                 info["model"] = current_session.get("model", "unknown")
@@ -94,7 +93,6 @@ def get_session_info() -> dict:
                 info["totalTokens"] = current_session.get("totalTokens", "unknown")
     except Exception:
         # Fall back to environment
-        info["sessionKey"] = os.environ.get("OPENCLAW_SESSION_KEY", "unknown")
         info["sessionId"] = os.environ.get("OPENCLAW_SESSION_ID", "unknown")
         info["agentId"] = os.environ.get("OPENCLAW_AGENT_ID", "unknown")
         info["model"] = os.environ.get("OPENCLAW_MODEL", "unknown")
@@ -117,7 +115,6 @@ def format_output(info: dict) -> str:
         "====================",
         f"Timestamp:        {info['timestamp']}",
         f"OpenClaw Version: {info['openclawVersion']}",
-        f"Session Key:      {info['sessionKey']}",
         f"Session ID:       {info['sessionId']}",
         f"Agent ID:         {info['agentId']}",
         f"Model:            {info['model']}",
@@ -138,18 +135,50 @@ def format_output(info: dict) -> str:
     return "\n".join(lines)
 
 
+def format_slack(info: dict) -> str:
+    """Format for Slack with code block for monospace alignment."""
+    lines = [
+        "*Session Info Summary*",
+        "```",
+        f"Timestamp:        {info['timestamp']}",
+        f"OpenClaw Version: {info['openclawVersion']}",
+        f"Session ID:       {info['sessionId']}",
+        f"Agent ID:         {info['agentId']}",
+        f"Model:            {info['model']}",
+        f"Model Provider:   {info['defaultModel']}",
+        f"Channel Kind:     {info['channel']}",
+        f"Status:           {info['status']}",
+        f"Visibility:       {info['visibility']}",
+        f"Session Kind:     {info['kind']}",
+        f"Context Tokens:   {info['contextTokens']}",
+        f"Input Tokens:     {info['inputTokens']}",
+        f"Output Tokens:    {info['outputTokens']}",
+        f"Total Tokens:     {info['totalTokens']}",
+        f"Host:             {info['host']}",
+        f"Repository:       {info['repo']}",
+        f"OS:               {info['os']}",
+        f"Node:             {info['nodeVersion']}",
+        "```",
+    ]
+    return "\n".join(lines)
+
+
 def format_json(info: dict) -> str:
     return json.dumps(info, indent=2)
 
 
 def main():
-    args = sys.argv[1:]
-    as_json = "--json" in args or "-j" in args
+    parser = argparse.ArgumentParser(description="Session Info Script")
+    parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+    parser.add_argument("--slack", action="store_true", help="Output formatted for Slack")
+    args = parser.parse_args()
 
     info = get_session_info()
 
-    if as_json:
+    if args.json:
         print(format_json(info))
+    elif args.slack:
+        print(format_slack(info))
     else:
         print(format_output(info))
 
