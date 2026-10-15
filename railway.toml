@@ -1,10 +1,10 @@
 [build]
-builder = "dockerfile"
+builder = "DOCKERFILE"
 
 [deploy]
 healthcheckPath = "/setup/healthz"
 healthcheckTimeout = 300
-restartPolicyType = "on_failure"
+restartPolicyType = "ON_FAILURE"
 
 [variables]
 PORT = "8080"
