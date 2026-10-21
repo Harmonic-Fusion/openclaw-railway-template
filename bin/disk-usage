@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Find what is eating disk space so you know what is safe to delete.
+
+Walks a directory tree, measures every file and directory, and reports the
+biggest files and biggest directories (largest first), so you can spot
+deletion candidates quickly.
+
+  disk-usage
+  disk-usage --min-size 1G
+  disk-usage /data/workspace --top-files 20 --top-dirs 20
+  disk-usage --json
+
+Positional:
+  PATH                   directory to scan (default /data)
+
+Options:
+  --min-size SIZE        only report files/dirs at or above this size
+                          (default 500M). Accepts B, K, M, G, T (e.g. 2G,
+                          500MB, 1024). Plain numbers are bytes.
+  --top-files N           max number of files to list (default 50, 0 = all
+                          that meet --min-size)
+  --top-dirs N            max number of directories to list (default 30, 0 =
+                          all that meet --min-size)
+  --follow-symlinks       follow symlinked directories (off by default, to
+                          avoid double-counting and infinite loops)
+  --json                  print a machine-readable report instead
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+
+DEFAULT_PATH = "/data"
+DEFAULT_MIN_SIZE = "500M"
+DEFAULT_TOP_FILES = 50
+DEFAULT_TOP_DIRS = 30
+
+UNITS = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+def parse_size(text: str) -> int:
+    raw = text.strip().upper().replace(" ", "")
+    if not raw:
+        raise ValueError("size must not be empty")
+    if raw.endswith("B") and not raw.endswith("IB") and len(raw) > 1 and raw[-2].isalpha():
+        raw = raw[:-1]  # "500MB" -> "500M"
+    suffix = raw[-1] if raw[-1].isalpha() else "B"
+    number_part = raw[:-1] if raw[-1].isalpha() else raw
+    if suffix not in UNITS:
+        raise ValueError(f"unknown size suffix: {suffix}")
+    try:
+        number = float(number_part)
+    except ValueError:
+        raise ValueError(f"invalid size: {text}") from None
+    if number < 0:
+        raise ValueError("size must not be negative")
+    return int(number * UNITS[suffix])
+
+
+def format_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "K", "M", "G", "T", "P"):
+        if value < 1024 or unit == "P":
+            if unit == "B":
+                return f"{int(value)}{unit}"
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}P"
+
+
+@dataclass
+class ScanResult:
+    root: str
+    files: list[tuple[str, int]] = field(default_factory=list)
+    dirs: list[tuple[str, int]] = field(default_factory=list)
+    scanned_files: int = 0
+    scanned_dirs: int = 0
+    errors: int = 0
+
+
+def scan(root: str, min_size_bytes: int, follow_symlinks: bool) -> ScanResult:
+    """Walk root bottom-up, accumulating directory sizes from their children."""
+    result = ScanResult(root=root)
+    dir_sizes: dict[str, int] = {}
+
+    def on_error(exc: OSError) -> None:
+        result.errors += 1
+
+    for dirpath, dirnames, filenames in os.walk(
+        root, topdown=False, onerror=on_error, followlinks=follow_symlinks
+    ):
+        total = 0
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            try:
+                size = os.lstat(path).st_size
+            except OSError:
+                result.errors += 1
+                continue
+            result.scanned_files += 1
+            total += size
+            if size >= min_size_bytes:
+                result.files.append((path, size))
+        for name in dirnames:
+            child = os.path.join(dirpath, name)
+            total += dir_sizes.get(child, 0)
+        dir_sizes[dirpath] = total
+        result.scanned_dirs += 1
+
+    root_norm = os.path.normpath(root)
+    for path, size in dir_sizes.items():
+        if os.path.normpath(path) == root_norm:
+            continue  # the scan root itself is always the biggest; not a useful "delete this" candidate
+        if size >= min_size_bytes:
+            result.dirs.append((path, size))
+
+    result.files.sort(key=lambda item: item[1], reverse=True)
+    result.dirs.sort(key=lambda item: item[1], reverse=True)
+    return result
+
+
+def build_report(result: ScanResult, top_files: int, top_dirs: int) -> dict:
+    files = result.files if top_files <= 0 else result.files[:top_files]
+    dirs = result.dirs if top_dirs <= 0 else result.dirs[:top_dirs]
+    return {
+        "root": result.root,
+        "scannedFiles": result.scanned_files,
+        "scannedDirs": result.scanned_dirs,
+        "unreadable": result.errors,
+        "totalLargeFiles": len(result.files),
+        "totalLargeDirs": len(result.dirs),
+        "files": [{"path": path, "bytes": size, "size": format_size(size)} for path, size in files],
+        "directories": [{"path": path, "bytes": size, "size": format_size(size)} for path, size in dirs],
+    }
+
+
+def format_report(report: dict, min_size_bytes: int) -> str:
+    threshold = format_size(min_size_bytes)
+    lines = [f"Disk usage analysis of {report['root']} (threshold {threshold})", ""]
+
+    lines.append(
+        f"Largest directories ({len(report['directories'])} of {report['totalLargeDirs']} "
+        f">= {threshold}):"
+    )
+    if report["directories"]:
+        for entry in report["directories"]:
+            lines.append(f"  {entry['size']:>8}  {entry['path']}/")
+    else:
+        lines.append(f"  (none >= {threshold})")
+    lines.append("")
+
+    lines.append(
+        f"Largest files ({len(report['files'])} of {report['totalLargeFiles']} >= {threshold}):"
+    )
+    if report["files"]:
+        for entry in report["files"]:
+            lines.append(f"  {entry['size']:>8}  {entry['path']}")
+    else:
+        lines.append(f"  (none >= {threshold})")
+    lines.append("")
+
+    lines.append(
+        f"Scanned {report['scannedFiles']} files in {report['scannedDirs']} directories"
+        + (f" ({report['unreadable']} unreadable, skipped)" if report["unreadable"] else "")
+        + "."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="disk-usage",
+        description="Find the biggest files and directories under a path.",
+    )
+    parser.add_argument("path", nargs="?", default=DEFAULT_PATH, help="directory to scan (default /data)")
+    parser.add_argument("--min-size", default=DEFAULT_MIN_SIZE, help="size threshold, e.g. 500M, 2G (default 500M)")
+    parser.add_argument("--top-files", type=int, default=DEFAULT_TOP_FILES, help="max files to list, 0 = all (default 50)")
+    parser.add_argument("--top-dirs", type=int, default=DEFAULT_TOP_DIRS, help="max directories to list, 0 = all (default 30)")
+    parser.add_argument("--follow-symlinks", action="store_true", help="follow symlinked directories")
+    parser.add_argument("--json", action="store_true", help="print JSON instead of text")
+    args = parser.parse_args(argv)
+
+    try:
+        min_size_bytes = parse_size(args.min_size)
+    except ValueError as exc:
+        print(f"disk-usage: {exc}", file=sys.stderr)
+        return 2
+
+    root = os.path.abspath(args.path)
+    if not os.path.isdir(root):
+        print(f"disk-usage: not a directory: {root}", file=sys.stderr)
+        return 1
+
+    result = scan(root, min_size_bytes, args.follow_symlinks)
+    report = build_report(result, args.top_files, args.top_dirs)
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        sys.stdout.write(format_report(report, min_size_bytes))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
