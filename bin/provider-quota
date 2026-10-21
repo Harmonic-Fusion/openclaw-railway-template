@@ -1,0 +1,715 @@
+#!/usr/bin/env python3
+"""Show remaining quota for every configured model provider.
+
+Reads live usage from `openclaw status --usage` and the model providers named
+in openclaw.json. Prints each remaining window, balance, or budget, then a
+link to add tokens. Providers that do not report a quota still get a link.
+
+  provider-quota
+  provider-quota --json
+  provider-quota --agent work
+
+Env:
+  OPENCLAW_STATE_DIR     config directory (default /data/.openclaw)
+  OPENCLAW_ENTRY         path to OpenClaw entry.js, when the CLI is not on PATH
+  OPENCLAW_NODE          node binary used with OPENCLAW_ENTRY (default node)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_TIMEOUT_SECONDS = 60
+
+# Canonical provider id -> (display name, [(link label, url), ...]).
+# Local runtimes have a name and no top-up page.
+PROVIDERS: dict[str, tuple[str, list[tuple[str, str]]]] = {
+    "anthropic": (
+        "Anthropic",
+        [
+            ("API credits", "https://platform.claude.com/settings/billing"),
+            ("Claude plan", "https://claude.ai/settings/usage"),
+        ],
+    ),
+    "openai": (
+        "OpenAI",
+        [
+            ("API credits", "https://platform.openai.com/settings/organization/billing"),
+            ("ChatGPT plan", "https://chatgpt.com/#pricing"),
+        ],
+    ),
+    "google": (
+        "Google",
+        [("Google AI billing", "https://aistudio.google.com/app/billing")],
+    ),
+    "deepseek": (
+        "DeepSeek",
+        [("Add credits", "https://platform.deepseek.com/top_up")],
+    ),
+    "openrouter": (
+        "OpenRouter",
+        [("Add credits", "https://openrouter.ai/settings/credits")],
+    ),
+    "xai": (
+        "xAI",
+        [("Add credits", "https://console.x.ai/team/default/billing")],
+    ),
+    "mistral": (
+        "Mistral",
+        [("Add credits", "https://console.mistral.ai/billing")],
+    ),
+    "together": (
+        "Together AI",
+        [("Add credits", "https://api.together.ai/settings/billing")],
+    ),
+    "huggingface": (
+        "Hugging Face",
+        [("Billing", "https://huggingface.co/settings/billing")],
+    ),
+    "copilot": (
+        "GitHub Copilot",
+        [("Copilot plan", "https://github.com/settings/copilot")],
+    ),
+    "moonshot": (
+        "Moonshot AI",
+        [("Add credits", "https://platform.moonshot.ai/console/pay")],
+    ),
+    "moonshot-cn": (
+        "Moonshot AI (CN)",
+        [("Add credits", "https://platform.moonshot.cn/console/pay")],
+    ),
+    "minimax": (
+        "MiniMax",
+        [("Plans and credits", "https://platform.minimax.io/")],
+    ),
+    "minimax-cn": (
+        "MiniMax (CN)",
+        [("Plans and credits", "https://platform.minimaxi.com/")],
+    ),
+    "zai": (
+        "Z.AI",
+        [("Account", "https://z.ai/")],
+    ),
+    "zai-cn": (
+        "Z.AI (CN)",
+        [("Add credits", "https://open.bigmodel.cn/finance-center/bill/recharge-details")],
+    ),
+    "qwen": (
+        "Qwen",
+        [("Plans and credits", "https://bailian.console.aliyun.com/")],
+    ),
+    "venice": (
+        "Venice AI",
+        [("API credits", "https://venice.ai/settings/api")],
+    ),
+    "chutes": (
+        "Chutes",
+        [("Account", "https://chutes.ai/app")],
+    ),
+    "kilocode": (
+        "Kilocode",
+        [("Account", "https://app.kilocode.ai/")],
+    ),
+    "xiaomi": (
+        "Xiaomi MiMo",
+        [("Balance and Token Plan", "https://platform.xiaomimimo.com/")],
+    ),
+    "volcengine": (
+        "Volcano Engine",
+        [("Ark billing", "https://console.volcengine.com/ark")],
+    ),
+    "byteplus": (
+        "BytePlus",
+        [("Ark billing", "https://console.byteplus.com/ark")],
+    ),
+    "qianfan": (
+        "Qianfan",
+        [("Qianfan console", "https://console.bce.baidu.com/qianfan/overview")],
+    ),
+    "ai-gateway": (
+        "Vercel AI Gateway",
+        [("Billing", "https://vercel.com/account/billing")],
+    ),
+    "cloudflare-ai-gateway": (
+        "Cloudflare AI Gateway",
+        [("Dashboard", "https://dash.cloudflare.com/")],
+    ),
+    "opencode": (
+        "OpenCode",
+        [("OpenCode Zen", "https://opencode.ai/zen")],
+    ),
+    "synthetic": (
+        "Synthetic",
+        [("Account", "https://synthetic.new/")],
+    ),
+    "groq": (
+        "Groq",
+        [("Billing", "https://console.groq.com/settings/billing")],
+    ),
+    "fireworks": (
+        "Fireworks AI",
+        [("Billing", "https://fireworks.ai/account/billing")],
+    ),
+    "cohere": (
+        "Cohere",
+        [("Billing", "https://dashboard.cohere.com/billing")],
+    ),
+    "perplexity": (
+        "Perplexity",
+        [("API settings", "https://www.perplexity.ai/settings/api")],
+    ),
+    "nvidia": (
+        "NVIDIA",
+        [("Billing", "https://build.nvidia.com/settings/billing")],
+    ),
+    "ollama": ("Ollama", []),
+    "vllm": ("vLLM", []),
+    "sglang": ("SGLang", []),
+    "litellm": ("LiteLLM", []),
+}
+
+ALIASES = {
+    "claude": "anthropic",
+    "openai-codex": "openai",
+    "codex": "openai",
+    "gemini": "google",
+    "google-gemini": "google",
+    "google-gemini-cli": "google",
+    "xai-oauth": "xai",
+    "grok": "xai",
+    "github-copilot": "copilot",
+    "copilot-proxy": "copilot",
+    "minimax-portal": "minimax",
+    "kimi": "moonshot",
+    "kimi-code": "moonshot",
+    "z.ai": "zai",
+    "z-ai": "zai",
+    "dashscope": "qwen",
+    "modelstudio": "qwen",
+    "xiaomi-token-plan": "xiaomi",
+    "doubao": "volcengine",
+    "vercel": "ai-gateway",
+    "vercel-ai-gateway": "ai-gateway",
+    "hf": "huggingface",
+    "opencode-zen": "opencode",
+    "opencode-go": "opencode",
+}
+
+HOSTS = {
+    "api.openai.com": "openai",
+    "api.anthropic.com": "anthropic",
+    "openrouter.ai": "openrouter",
+    "api.x.ai": "xai",
+    "api.deepseek.com": "deepseek",
+    "api.groq.com": "groq",
+    "api.mistral.ai": "mistral",
+    "api.together.ai": "together",
+    "api.together.xyz": "together",
+    "generativelanguage.googleapis.com": "google",
+    "api.moonshot.ai": "moonshot",
+    "api.moonshot.cn": "moonshot-cn",
+    "api.minimax.io": "minimax",
+    "api.minimaxi.com": "minimax-cn",
+    "api.z.ai": "zai",
+    "open.bigmodel.cn": "zai-cn",
+    "api.xiaomimimo.com": "xiaomi",
+}
+
+LOCAL = {"ollama", "vllm", "sglang", "litellm"}
+
+
+def state_dir() -> Path:
+    raw = os.environ.get("OPENCLAW_STATE_DIR", "").strip()
+    return Path(raw or "/data/.openclaw")
+
+
+def config_path() -> Path:
+    return state_dir() / "openclaw.json"
+
+
+def openclaw_command(*args: str) -> list[str]:
+    entry = os.environ.get("OPENCLAW_ENTRY", "").strip()
+    node = os.environ.get("OPENCLAW_NODE", "").strip() or "node"
+    if entry:
+        return [node, entry, *args]
+    return ["openclaw", *args]
+
+
+def drop_privileges() -> None:
+    """Re-run as the openclaw user when the Railway console is root.
+
+    gosu starts this script again under that user. os.geteuid() is no longer 0
+    there, so the second process does not launch itself again.
+    """
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    if not shutil.which("gosu") or not Path("/home/openclaw").is_dir():
+        return
+    env = os.environ.copy()
+    env["HOME"] = "/home/openclaw"
+    env["USER"] = "openclaw"
+    env["LOGNAME"] = "openclaw"
+    os.execvpe("gosu", ["gosu", "openclaw", sys.executable, *sys.argv], env)
+
+
+def canonical(provider_id: str) -> str:
+    key = provider_id.strip().lower()
+    return ALIASES.get(key, key)
+
+
+def provider_info(provider_id: str) -> tuple[str, list[tuple[str, str]]]:
+    key = canonical(provider_id)
+    if key in PROVIDERS:
+        return PROVIDERS[key]
+    label = provider_id.strip().replace("_", " ").replace("-", " ")
+    label = " ".join(part.capitalize() for part in label.split()) or provider_id
+    return label, []
+
+
+def load_config() -> dict:
+    path = config_path()
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def add_model_ref(found: set[str], ref: object) -> None:
+    if not isinstance(ref, str) or "/" not in ref:
+        return
+    provider = ref.split("/", 1)[0].strip()
+    if provider:
+        found.add(provider)
+
+
+def configured_providers(config: dict) -> list[str]:
+    found: set[str] = set()
+    models = config.get("models")
+    if isinstance(models, dict):
+        providers = models.get("providers")
+        if isinstance(providers, dict):
+            for key in providers:
+                if isinstance(key, str) and key.strip():
+                    found.add(key.strip())
+
+    def walk(node: object, key: str | None = None) -> None:
+        if key == "models" and isinstance(node, dict):
+            for model_id in node:
+                add_model_ref(found, model_id)
+        if key in {"model", "primary", "imageModel", "utilityModel"} and isinstance(node, str):
+            add_model_ref(found, node)
+        if key == "fallbacks" and isinstance(node, list):
+            for item in node:
+                add_model_ref(found, item)
+                if isinstance(item, dict):
+                    walk(item, key)
+        if isinstance(node, dict):
+            for child_key, child in node.items():
+                walk(child, child_key)
+        elif isinstance(node, list) and key != "fallbacks":
+            for item in node:
+                walk(item, key)
+
+    walk(config.get("agents"))
+    return sorted(found, key=lambda item: item.lower())
+
+
+def provider_base_url(config: dict, provider_id: str) -> str:
+    models = config.get("models")
+    if not isinstance(models, dict):
+        return ""
+    providers = models.get("providers")
+    if not isinstance(providers, dict):
+        return ""
+    entry = providers.get(provider_id)
+    if not isinstance(entry, dict):
+        return ""
+    base = entry.get("baseUrl") or entry.get("baseURL") or ""
+    return base if isinstance(base, str) else ""
+
+
+def links_for(provider_id: str, base_url: str) -> list[dict[str, str]]:
+    key = canonical(provider_id)
+    host_key = ""
+    lowered = base_url.lower()
+    for host, mapped in HOSTS.items():
+        if host in lowered:
+            host_key = mapped
+            break
+    chosen = host_key or key
+    _name, links = provider_info(chosen if chosen in PROVIDERS or chosen in ALIASES else key)
+    if chosen in PROVIDERS:
+        links = PROVIDERS[chosen][1]
+    elif key in PROVIDERS:
+        links = PROVIDERS[key][1]
+    return [{"label": label, "url": url} for label, url in links]
+
+
+def clamp_percent(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(100.0, number))
+
+
+def remaining_percent(window: dict) -> float | None:
+    if "remainingPercent" in window:
+        return clamp_percent(window.get("remainingPercent"))
+    if "usedPercent" in window:
+        used = clamp_percent(window.get("usedPercent"))
+        if used is None:
+            return None
+        return clamp_percent(100 - used)
+    return None
+
+
+def parse_reset(value: object) -> datetime | None:
+    if isinstance(value, (int, float)) and value > 0:
+        seconds = float(value) / 1000 if value > 10_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and value.strip():
+        text = value.strip().replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
+
+
+def format_reset(when: datetime | None, now: datetime) -> str | None:
+    if when is None:
+        return None
+    diff = int((when - now).total_seconds())
+    if diff <= 0:
+        return "now"
+    minutes = diff // 60
+    if minutes < 60:
+        return f"in {minutes}m"
+    hours, mins = divmod(minutes, 60)
+    if hours < 24:
+        return f"in {hours}h {mins}m" if mins else f"in {hours}h"
+    days, hours = divmod(hours, 24)
+    if days < 7:
+        return f"in {days}d {hours}h"
+    stamp = when.astimezone(timezone.utc)
+    return f"{stamp.strftime('%b')} {stamp.day}"
+
+
+def format_percent(value: float) -> str:
+    if abs(value - round(value)) < 0.05:
+        return f"{round(value):.0f}%"
+    return f"{value:.1f}%"
+
+
+def format_amount(amount: object, unit: object) -> str | None:
+    try:
+        number = float(amount)
+    except (TypeError, ValueError):
+        return None
+    unit_text = unit.strip() if isinstance(unit, str) else ""
+    if unit_text.upper() == "USD":
+        return f"${number:,.2f}"
+    rendered = f"{number:,.2f}"
+    return f"{rendered} {unit_text}".strip() if unit_text else rendered
+
+
+def window_row(window: dict, now: datetime) -> dict | None:
+    if not isinstance(window, dict):
+        return None
+    label = window.get("label") or window.get("name") or "quota"
+    group = window.get("groupLabel")
+    if isinstance(group, str) and group.strip() and group.strip().lower() not in str(label).lower():
+        label = f"{group.strip()} {label}"
+    remaining = remaining_percent(window)
+    if remaining is None:
+        return None
+    used = clamp_percent(window.get("usedPercent"))
+    reset = parse_reset(window.get("resetAt"))
+    return {
+        "label": str(label),
+        "remainingPercent": remaining,
+        "usedPercent": used,
+        "resets": format_reset(reset, now),
+        "resetsAt": reset.isoformat() if reset else None,
+    }
+
+
+def billing_row(entry: dict) -> dict | None:
+    if not isinstance(entry, dict):
+        return None
+    kind = entry.get("type")
+    unit = entry.get("unit")
+    label = entry.get("label") if isinstance(entry.get("label"), str) else ""
+    period = entry.get("period") if isinstance(entry.get("period"), str) else ""
+    if kind == "balance":
+        amount = format_amount(entry.get("amount"), unit)
+        if amount is None:
+            return None
+        text = f"{amount} left"
+    elif kind == "budget":
+        used = format_amount(entry.get("used"), unit)
+        limit = format_amount(entry.get("limit"), unit)
+        if used is None or limit is None:
+            return None
+        try:
+            left = float(entry.get("limit")) - float(entry.get("used"))
+        except (TypeError, ValueError):
+            left = None
+        left_text = format_amount(left, unit) if left is not None else None
+        text = f"{left_text} left of {limit}" if left_text else f"{used} used of {limit}"
+    elif kind == "spend":
+        amount = format_amount(entry.get("amount"), unit)
+        if amount is None:
+            return None
+        text = f"{amount} spent"
+    else:
+        return None
+    if period:
+        text = f"{text} ({period})"
+    return {"label": label or kind, "text": text}
+
+
+def snapshot_rows(snapshots: list) -> dict[str, dict]:
+    rows: dict[str, dict] = {}
+    now = datetime.now(timezone.utc)
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict):
+            continue
+        provider_id = snapshot.get("provider") or snapshot.get("id") or ""
+        if not isinstance(provider_id, str) or not provider_id.strip():
+            continue
+        provider_id = provider_id.strip()
+        name = snapshot.get("displayName")
+        if not isinstance(name, str) or not name.strip():
+            name = provider_info(provider_id)[0]
+        windows = [
+            row
+            for row in (
+                window_row(item, now)
+                for item in snapshot.get("windows") or []
+                if isinstance(item, dict)
+            )
+            if row
+        ]
+        billing = [
+            row
+            for row in (billing_row(item) for item in snapshot.get("billing") or [])
+            if row
+        ]
+        summary = snapshot.get("summary") if isinstance(snapshot.get("summary"), str) else ""
+        plan = snapshot.get("plan") if isinstance(snapshot.get("plan"), str) else ""
+        error = snapshot.get("error") if isinstance(snapshot.get("error"), str) else ""
+        rows[provider_id] = {
+            "id": provider_id,
+            "name": name.strip(),
+            "plan": plan.strip(),
+            "summary": summary.strip(),
+            "error": error.strip(),
+            "windows": windows,
+            "billing": billing,
+        }
+    return rows
+
+
+def extract_json(text: str) -> dict:
+    raw = text.strip()
+    if not raw:
+        raise ValueError("openclaw returned no JSON")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("openclaw returned no JSON") from None
+        value = json.loads(raw[start : end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("openclaw JSON was not an object")
+    return value
+
+
+def usage_from_payload(payload: dict) -> tuple[list, int | None, bool]:
+    usage = payload.get("usage")
+    if isinstance(usage, dict) and isinstance(usage.get("providers"), list):
+        updated = usage.get("updatedAt")
+        return (
+            usage["providers"],
+            updated if isinstance(updated, int) else None,
+            bool(usage.get("refreshing")),
+        )
+    return [], None, False
+
+
+def load_usage(agent: str | None, timeout_seconds: float) -> tuple[list, int | None, bool]:
+    timeout_ms = max(1, int(timeout_seconds * 1000))
+    args = ["status", "--usage", "--json", "--timeout", str(timeout_ms)]
+    if agent:
+        args.extend(["--agent", agent])
+    try:
+        proc = subprocess.run(
+            openclaw_command(*args),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 15,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("openclaw is not available") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("openclaw status --usage timed out") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        message = detail[-1] if detail else f"exit {proc.returncode}"
+        raise RuntimeError(message)
+    payload = extract_json(proc.stdout)
+    return usage_from_payload(payload)
+
+
+def build_report(config: dict, snapshots: list, usage_error: str | None) -> dict:
+    live = snapshot_rows(snapshots)
+    ordered: list[str] = list(live)
+    for provider_id in configured_providers(config):
+        if provider_id not in live:
+            ordered.append(provider_id)
+    providers = []
+    for provider_id in ordered:
+        row = live.get(provider_id, {})
+        name, _links = provider_info(provider_id)
+        base_url = provider_base_url(config, provider_id)
+        key = canonical(provider_id)
+        note = ""
+        error = row.get("error") or ""
+        if not row and key in LOCAL:
+            note = "runs locally"
+        elif not row and usage_error:
+            error = usage_error
+        elif not row:
+            note = "not reported"
+        providers.append(
+            {
+                "id": provider_id,
+                "name": row.get("name") or name,
+                "plan": row.get("plan") or "",
+                "summary": row.get("summary") or "",
+                "error": error,
+                "note": note,
+                "windows": row.get("windows") or [],
+                "billing": row.get("billing") or [],
+                "addTokens": links_for(provider_id, base_url),
+            }
+        )
+    return {"providers": providers}
+
+
+def format_report(report: dict) -> str:
+    providers = report.get("providers") or []
+    if not providers:
+        return "No model providers are configured, and no usage was reported."
+    blocks = ["Provider quota", ""]
+    for entry in providers:
+        title = entry["name"]
+        if entry.get("plan"):
+            title = f"{title} — {entry['plan']}"
+        blocks.append(title)
+        lines: list[tuple[str, str]] = []
+        for window in entry.get("windows") or []:
+            detail = f"{format_percent(window['remainingPercent'])} left"
+            if window.get("resets"):
+                detail = f"{detail}  resets {window['resets']}"
+            lines.append((str(window["label"]), detail))
+        for item in entry.get("billing") or []:
+            lines.append((item.get("label") or "balance", item["text"]))
+        if not lines and entry.get("summary"):
+            lines.append(("quota", entry["summary"]))
+        if entry.get("error"):
+            lines.append(("quota", f"unavailable ({entry['error']})"))
+        elif entry.get("note") and not lines:
+            lines.append(("quota", entry["note"]))
+        for link in entry.get("addTokens") or []:
+            lines.append((link["label"], link["url"]))
+        if not lines:
+            lines.append(("quota", "not reported"))
+        width = max(len(label) for label, _detail in lines)
+        for label, detail in lines:
+            blocks.append(f"  {label.ljust(width)}  {detail}")
+        blocks.append("")
+    return "\n".join(blocks).rstrip() + "\n"
+
+
+def main(argv: list[str]) -> int:
+    agent = None
+    as_json = False
+    timeout = float(DEFAULT_TIMEOUT_SECONDS)
+    args = argv[1:]
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--json":
+            as_json = True
+        elif arg == "--agent":
+            if index + 1 >= len(args):
+                print("usage: provider-quota [--json] [--agent ID] [--timeout SECONDS]", file=sys.stderr)
+                return 2
+            index += 1
+            agent = args[index]
+        elif arg == "--timeout":
+            if index + 1 >= len(args):
+                print("usage: provider-quota [--json] [--agent ID] [--timeout SECONDS]", file=sys.stderr)
+                return 2
+            index += 1
+            try:
+                timeout = float(args[index])
+            except ValueError:
+                print("--timeout must be a number of seconds", file=sys.stderr)
+                return 2
+            if timeout <= 0:
+                print("--timeout must be greater than 0", file=sys.stderr)
+                return 2
+        elif arg in {"-h", "--help"}:
+            print(__doc__.strip())
+            return 0
+        else:
+            print(f"unknown argument: {arg}", file=sys.stderr)
+            return 2
+        index += 1
+
+    drop_privileges()
+    config = load_config()
+    usage_error = None
+    snapshots: list = []
+    try:
+        snapshots, _updated, refreshing = load_usage(agent, timeout)
+        if refreshing and not snapshots:
+            usage_error = "usage is still refreshing; run this again in a moment"
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        usage_error = str(exc)
+
+    report = build_report(config, snapshots, usage_error)
+    if not report["providers"]:
+        message = usage_error or "No model providers are configured, and no usage was reported."
+        print(message, file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        sys.stdout.write(format_report(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

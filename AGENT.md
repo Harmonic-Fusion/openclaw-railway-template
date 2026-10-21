@@ -74,7 +74,7 @@ open http://localhost:8080/setup  # password: test
   - **setup.html**: Setup wizard HTML structure
   - **styles.css**: Setup wizard styling (extracted from inline styles)
   - **setup-app.js**: Client-side JS for `/setup` wizard (vanilla JS, no build step)
-- **bin/**: Console helpers, copied to `/app/bin` and added to `PATH` (also re-added in `/etc/profile.d/openclaw.sh`, since login shells rebuild `PATH`). Contains `r2-sync`, the inotify-driven R2 workspace sync job. `cdw` lives in the same profile snippet as an alias, because a script cannot change the caller's working directory.
+- **bin/**: Console helpers, copied to `/app/bin` and added to `PATH` (also re-added in `/etc/profile.d/openclaw.sh`, since login shells rebuild `PATH`). Contains `r2-sync`, the inotify-driven R2 workspace sync job, and `provider-quota`, which prints remaining provider quota and top-up links. `cdw` lives in the same profile snippet as an alias, because a script cannot change the caller's working directory.
 - **Dockerfile**: Single-stage build (installs OpenClaw via npm, installs wrapper deps)
 
 ### Environment Variables

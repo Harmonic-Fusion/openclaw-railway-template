@@ -67,6 +67,7 @@ docker run --rm -p 8080:8080 \
 Scripts in `bin/` are installed to `/app/bin` and are on `PATH` in the Railway console:
 
 - `cdw` — `cd` to the workspace directory (`OPENCLAW_WORKSPACE_DIR`, falling back to `${OPENCLAW_STATE_DIR:-/data/.openclaw}/workspace`). It is a shell alias, so it changes your current shell's directory.
+- `provider-quota` — remaining quota for every configured model provider, plus a link to add tokens. `provider-quota --json` prints the same report as JSON.
 - `r2-sync` — the R2 workspace sync job (see below). The entrypoint already runs it in the background when `R2_BUCKET` is set.
 
 ## Sync the workspace with Cloudflare R2 (Obsidian)
