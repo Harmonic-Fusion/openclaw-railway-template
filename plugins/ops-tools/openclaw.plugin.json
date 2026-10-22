@@ -1,0 +1,38 @@
+{
+  "id": "ops-tools",
+  "name": "Ops Tools",
+  "description": "Typed tools for the console helper scripts in /app/bin.",
+  "categories": [
+    "developer-tools"
+  ],
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "binDir": {
+        "type": "string",
+        "description": "Directory holding the helper scripts (default /app/bin)."
+      },
+      "timeoutMs": {
+        "type": "number",
+        "description": "Per-command timeout in milliseconds (default 120000)."
+      }
+    }
+  },
+  "version": "1.0.0",
+  "contracts": {
+    "tools": [
+      "ops_disk_usage",
+      "ops_provider_quota",
+      "ops_session_info",
+      "ops_update_models"
+    ]
+  },
+  "toolMetadata": {
+    "ops_update_models": {
+      "optional": true
+    }
+  }
+}

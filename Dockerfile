@@ -42,6 +42,21 @@ RUN npm install -g pnpm@11.24.0 \
 COPY src ./src
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
 COPY --chmod=755 bin ./bin
+
+# Tool plugin wrapping bin/ as typed agent tools. Enable it with:
+#   openclaw config set --json plugins.load.paths '["/app/plugins/ops-tools"]'
+# --legacy-peer-deps keeps npm from pulling a second ~250 MB openclaw in as an
+# auto-installed peer; the globally installed one is linked instead, so the
+# plugin builds and runs against the same SDK version as the gateway. npm prune
+# drops that link, so it is recreated afterwards.
+COPY plugins ./plugins
+RUN cd plugins/ops-tools \
+  && npm install --no-audit --no-fund --legacy-peer-deps \
+  && ln -sfn /usr/local/lib/node_modules/openclaw node_modules/openclaw \
+  && npm run build \
+  && npm prune --omit=dev --legacy-peer-deps \
+  && ln -sfn /usr/local/lib/node_modules/openclaw node_modules/openclaw
+
 COPY --chmod=644 docker/etc/profile.d/ /etc/profile.d/
 COPY --chmod=644 docker/etc/ssh/ssh_config.d/github.conf /etc/ssh/ssh_config.d/github.conf
 COPY docker/etc/bash.bashrc.d/openclaw.sh /tmp/openclaw-bashrc
@@ -50,8 +65,13 @@ RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc
 # ~/.openclaw and ~/.ssh follow the volume so CLI sessions, the default state
 # dir, and the GitHub key pair share one persistent directory. The mount hides
 # /data at runtime; entrypoint recreates the targets and the ~/.ssh link.
+#
+# /app stays root-owned and not writable. Removing write on bin/ and plugins/
+# alone is not enough: deleting or replacing those directories only needs write
+# permission on /app. The wrapper only writes under /data.
 RUN useradd -m -s /bin/bash openclaw \
-  && chown -R openclaw:openclaw /app \
+  && chown -R root:root /app \
+  && chmod -R a-w /app \
   && mkdir -p /data/.openclaw/ssh \
   && chmod 700 /data/.openclaw/ssh \
   && chown openclaw:openclaw /data /data/.openclaw /data/.openclaw/ssh \

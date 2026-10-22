@@ -11,6 +11,8 @@ __pycache__
 
 # Build artifacts
 /dist
+plugins/*/dist
+plugins/*/.tmpstate
 
 # Backup exports
 *.tar.gz

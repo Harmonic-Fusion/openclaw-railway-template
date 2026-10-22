@@ -1,0 +1,70 @@
+{
+  "tools": [
+    {
+      "name": "ops_disk_usage",
+      "label": "Disk Usage",
+      "description": "Find the biggest files and directories under a path so you know what is safe to delete. Read-only. Scans /data by default.",
+      "command": "disk-usage",
+      "args": ["--json"],
+      "result": { "format": "json", "key": "report" },
+      "parameters": {
+        "path": {
+          "type": "string",
+          "positional": true,
+          "description": "Directory to scan. Defaults to /data."
+        },
+        "minSize": {
+          "type": "string",
+          "flag": "--min-size",
+          "description": "Only report entries at or above this size, e.g. 500M, 2G. Defaults to 500M."
+        },
+        "topFiles": {
+          "type": "integer",
+          "flag": "--top-files",
+          "description": "Max files to list. 0 lists all matches. Defaults to 50."
+        },
+        "topDirs": {
+          "type": "integer",
+          "flag": "--top-dirs",
+          "description": "Max directories to list. 0 lists all matches. Defaults to 30."
+        },
+        "followSymlinks": {
+          "type": "boolean",
+          "flag": "--follow-symlinks",
+          "description": "Follow symlinked directories. Off by default."
+        }
+      }
+    },
+    {
+      "name": "ops_provider_quota",
+      "label": "Provider Quota",
+      "description": "Remaining quota, balance, or budget for every configured model provider, plus top-up links. Read-only.",
+      "command": "provider-quota",
+      "args": ["--json"],
+      "result": { "format": "json", "key": "report" },
+      "parameters": {
+        "agent": {
+          "type": "string",
+          "flag": "--agent",
+          "description": "Report for a specific agent id instead of the default."
+        }
+      }
+    },
+    {
+      "name": "ops_session_info",
+      "label": "Session Info",
+      "description": "Summary of the current OpenClaw session: session id, agent, model, token counts, host, and repo. Read-only.",
+      "command": "session-info.py",
+      "args": ["--json"],
+      "result": { "format": "json", "key": "session" }
+    },
+    {
+      "name": "ops_update_models",
+      "label": "Update Models",
+      "description": "Merge the model list from models.md into openclaw.json. Validates before writing and keeps a timestamped backup. Changes gateway configuration.",
+      "command": "update-models",
+      "optional": true,
+      "result": { "format": "text" }
+    }
+  ]
+}

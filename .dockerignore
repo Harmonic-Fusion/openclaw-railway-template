@@ -1,0 +1,24 @@
+.git
+.gitignore
+.github
+
+# Installed/built in the image, never copied from the host
+node_modules
+**/node_modules
+plugins/*/dist
+plugins/*/.tmpstate
+
+# Local-only state and scratch
+.tmpdata
+untracked_dev
+__pycache__
+**/__pycache__
+*.tar.gz
+.env
+
+# Editor/assistant config
+.claude
+.cursor
+.serena
+.contextual
+.DS_Store
