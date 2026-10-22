@@ -9,10 +9,11 @@
     "tools.json",
     "openclaw.plugin.json"
   ],
+  "packageManager": "pnpm@11.24.0",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
-    "plugin:validate": "npm run build && openclaw plugins validate --entry ./dist/index.js"
+    "plugin:build": "pnpm run build && openclaw plugins build --entry ./dist/index.js",
+    "plugin:validate": "pnpm run build && openclaw plugins validate --entry ./dist/index.js"
   },
   "dependencies": {
     "typebox": "1.3.37"

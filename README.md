@@ -71,18 +71,6 @@ Scripts in `bin/` are installed to `/app/bin` and are on `PATH` in the Railway c
 - `disk-usage` — finds the biggest files and directories under `/data` (or any path) so you know what's safe to delete. `disk-usage --min-size 1G` raises the threshold (default `500M`); `disk-usage --json` prints the same report as JSON.
 - `r2-sync` — the R2 workspace sync job (see below). The entrypoint already runs it in the background when `R2_BUCKET` is set.
 
-## Agent tools for the console helpers
-
-`plugins/ops-tools` is an OpenClaw tool plugin that exposes the helpers above as typed agent tools, so the assistant can answer "what's eating disk space?" from Slack without composing a shell command. It is built into the image at `/app/plugins/ops-tools` but is not loaded until you point OpenClaw at it:
-
-```bash
-openclaw config set --json plugins.load.paths '["/app/plugins/ops-tools"]'
-openclaw config set --json plugins.entries.ops-tools '{"enabled":true}'
-openclaw gateway restart
-```
-
-The tools are declared in `plugins/ops-tools/tools.json` (name, description, script, and whether each parameter maps to a flag or a positional), so adding one for a new script is a JSON edit followed by `npm run plugin:build`.
-
 ## Sync the workspace with Cloudflare R2 (Obsidian)
 
 Optional. A background job two-way syncs `/data/workspace` (`MEMORY.md`, `memory/`, `AGENTS.md`, skills, ...) with an R2 bucket using `rclone bisync`, so you can edit the markdown in Obsidian. Leave `R2_BUCKET` unset to disable it. `/data/.openclaw` (config, gateway token) is never synced.

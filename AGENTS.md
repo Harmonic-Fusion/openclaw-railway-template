@@ -51,7 +51,7 @@ open http://localhost:8080/setup  # password: test
 - **Test setup wizard**: delete `${STATE_DIR}/openclaw.json` (or Reset in UI) → visit `/setup` → check logs.
 - **Test auth**: setup wizard — clear browser auth, expect Basic challenge. Gateway — remove header injection (src/server.js:736), expect failures.
 - **Debug gateway startup**: look for `[gateway] starting...` (142), `[gateway] ready...` (100), `[gateway] failed to become ready...` (109). Verify `openclaw.json` valid, `STATE_DIR`/`WORKSPACE_DIR` writable, bearer token set.
-- **Add a `bin/` command**: write the executable in `bin/` (support `--help`, add `--json` if output is structured) → declare it in `plugins/ops-tools/tools.json` (`ops_*` name, `command`, always-on `args`, `result.format`, one `parameters` entry per flag/positional) → `cd plugins/ops-tools && npm run plugin:build` to regenerate `openclaw.plugin.json`, else validation reports stale metadata → list it under Console helpers in README.
+- **Add a `bin/` command**: see `plugins/ops-tools/AGENTS.md`. Declare it in `tools.json`, then `pnpm run plugin:build`.
 - **Modify onboarding args**: edit `buildOnboardArgs()` (src/server.js:442-496).
 - **Add channel type**: add fields to `src/public/setup.html` → config-writing logic in `/setup/api/run` → collection logic in `setup-app.js`.
 

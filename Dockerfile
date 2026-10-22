@@ -45,16 +45,14 @@ COPY --chmod=755 bin ./bin
 
 # Tool plugin wrapping bin/ as typed agent tools. Enable it with:
 #   openclaw config set --json plugins.load.paths '["/app/plugins/ops-tools"]'
-# --legacy-peer-deps keeps npm from pulling a second ~250 MB openclaw in as an
-# auto-installed peer; the globally installed one is linked instead, so the
-# plugin builds and runs against the same SDK version as the gateway. npm prune
-# drops that link, so it is recreated afterwards.
+# openclaw is a peer and is not in the lockfile. Link the global install so the
+# build uses the same SDK as the gateway. pnpm prune drops that link.
 COPY plugins ./plugins
 RUN cd plugins/ops-tools \
-  && npm install --no-audit --no-fund --legacy-peer-deps \
+  && pnpm install --frozen-lockfile \
   && ln -sfn /usr/local/lib/node_modules/openclaw node_modules/openclaw \
-  && npm run build \
-  && npm prune --omit=dev --legacy-peer-deps \
+  && pnpm run build \
+  && pnpm prune --prod \
   && ln -sfn /usr/local/lib/node_modules/openclaw node_modules/openclaw
 
 COPY --chmod=644 docker/etc/profile.d/ /etc/profile.d/

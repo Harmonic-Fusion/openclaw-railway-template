@@ -1,0 +1,8 @@
+# pnpm 11 reads settings from here, not from .npmrc.
+# openclaw is a peer satisfied by the global install; do not fetch it.
+autoInstallPeers: false
+strictPeerDependencies: false
+confirmModulesPurge: false
+peerDependencyRules:
+  ignoreMissing:
+    - openclaw
