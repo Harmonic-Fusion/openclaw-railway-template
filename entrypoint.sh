@@ -10,6 +10,34 @@ chmod 644 /run/container.env
 mkdir -p /data/.openclaw/ssh
 chown -R openclaw:openclaw /data
 chmod 700 /data /data/.openclaw/ssh
+
+# Plugins are installed at image build into /opt/openclaw-plugin-seed.
+# Copy them onto the volume state dir. A symlink is not discovered.
+# The stamp skips this after the first boot of a given image.
+seed_plugins() {
+  local seed=/opt/openclaw-plugin-seed/npm/projects
+  local stamp_src=/opt/openclaw-plugin-seed/STAMP
+  local state="${OPENCLAW_STATE_DIR:-/data/.openclaw}"
+  local stamp_file="$state/npm/.image-plugins-stamp"
+  local project name
+  [ -d "$seed" ] && [ -f "$stamp_src" ] || return 0
+  if [ -f "$stamp_file" ] && cmp -s "$stamp_src" "$stamp_file"; then
+    return 0
+  fi
+  mkdir -p "$state/npm/projects"
+  for project in "$seed"/*; do
+    [ -d "$project" ] || continue
+    name="$(basename "$project")"
+    case "$name" in
+      .*) continue ;;
+    esac
+    rm -rf "$state/npm/projects/$name"
+    cp -a "$project" "$state/npm/projects/$name"
+  done
+  cp -a "$stamp_src" "$stamp_file"
+  chown -R openclaw:openclaw "$state/npm"
+}
+seed_plugins
 # Keys are created on the volume (github / github.pub). ~/.ssh follows that
 # directory. /etc/ssh/ssh_config.d/github.conf selects this key for github.com.
 # Private key must be 600 or ssh refuses it.

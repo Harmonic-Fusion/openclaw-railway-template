@@ -23,6 +23,27 @@ RUN npm install -g \
     openclaw@2026.9.7 \
   && node --version | grep -Eq '^v26\.' \
   && openclaw --version | grep -Eq '^OpenClaw 2026\.9\.7( |$)'
+
+# Same release as OpenClaw. An unpinned spec resolves the newest ClawHub
+# build, and that build requires a newer plugin API than 2026.9.7.
+# The Railway volume hides /data, so this seed stays in the image.
+# entrypoint.sh copies npm/projects onto $OPENCLAW_STATE_DIR.
+RUN mkdir -p /opt/openclaw-plugin-seed \
+  && OPENCLAW_STATE_DIR=/opt/openclaw-plugin-seed \
+     openclaw plugins install @openclaw/deepinfra-provider@2026.9.7 \
+  && OPENCLAW_STATE_DIR=/opt/openclaw-plugin-seed \
+     openclaw plugins install @openclaw/groq-provider@2026.9.7 \
+  && OPENCLAW_STATE_DIR=/opt/openclaw-plugin-seed \
+     openclaw plugins install @openclaw/perplexity-plugin@2026.9.7 \
+  && printf '%s\n' \
+    '@openclaw/deepinfra-provider@2026.9.7' \
+    '@openclaw/groq-provider@2026.9.7' \
+    '@openclaw/perplexity-plugin@2026.9.7' \
+    > /opt/openclaw-plugin-seed/STAMP \
+  && find /opt/openclaw-plugin-seed -mindepth 1 -maxdepth 1 \
+    ! -name npm ! -name STAMP -exec rm -rf {} + \
+  && rm -rf /opt/openclaw-plugin-seed/npm/projects/.openclaw-install-stage-*
+
 RUN npm install -g clawhub@latest
 
 # rclone (pinned) for optional R2 workspace sync; apt's version is too old for bisync
