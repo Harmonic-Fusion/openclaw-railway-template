@@ -10,11 +10,11 @@ OpenClaw only reports usage for providers whose plugin declares a usage hook
 DeepInfra, Groq and Perplexity have no hook, so this script calls their APIs
 directly with the keys in the environment. See PROBES.
 
-  provider-quota
-  provider-quota --json
-  provider-quota --agent work
-  provider-quota --groq-probe      spend one token to read Groq rate limits
-  provider-quota --no-probe        skip the direct provider API calls
+  quotas
+  quotas --json
+  quotas --agent work
+  quotas --groq-probe      spend one token to read Groq rate limits
+  quotas --no-probe        skip the direct provider API calls
 
 Env:
   OPENCLAW_STATE_DIR     config directory (default /data/.openclaw)
@@ -345,7 +345,7 @@ def fetch_json(
     body: dict | None = None,
 ) -> dict:
     """One JSON request. Never raises; failures come back in ["error"]."""
-    headers = {"Accept": "application/json", "User-Agent": "provider-quota"}
+    headers = {"Accept": "application/json", "User-Agent": "quotas"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     payload = None
@@ -1051,7 +1051,7 @@ def format_report(report: dict) -> str:
     providers = report.get("providers") or []
     if not providers:
         return "No model providers are configured, and no usage was reported."
-    blocks = ["Provider quota", ""]
+    blocks = ["Quotas", ""]
     for entry in providers:
         title = entry["name"]
         if entry.get("plan"):
@@ -1085,8 +1085,8 @@ def format_report(report: dict) -> str:
 
 
 USAGE = (
-    "usage: provider-quota [--json] [--agent ID] [--timeout SECONDS]\n"
-    "                      [--probe-timeout SECONDS] [--no-probe] [--groq-probe]"
+    "usage: quotas [--json] [--agent ID] [--timeout SECONDS]\n"
+    "              [--probe-timeout SECONDS] [--no-probe] [--groq-probe]"
 )
 
 

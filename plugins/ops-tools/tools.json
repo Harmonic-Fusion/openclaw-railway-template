@@ -36,10 +36,10 @@
       }
     },
     {
-      "name": "ops_provider_quota",
-      "label": "Provider Quota",
+      "name": "ops_quotas",
+      "label": "Quotas",
       "description": "Remaining quota, balance, or budget for every configured model provider, plus top-up links. Calls the DeepInfra, Groq and Perplexity APIs directly, since OpenClaw reports no usage for them. Read-only.",
-      "command": "provider-quota",
+      "command": "quotas",
       "args": ["--json"],
       "result": { "format": "json", "key": "report" },
       "parameters": {

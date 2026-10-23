@@ -25,7 +25,7 @@
   "contracts": {
     "tools": [
       "ops_disk_usage",
-      "ops_provider_quota",
+      "ops_quotas",
       "ops_session_info",
       "ops_update_models"
     ]
