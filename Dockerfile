@@ -11,12 +11,20 @@ RUN apt-get update \
     inotify-tools \
     procps \
     python3 \
+    python3-pip \
     tini \
     build-essential \
     zip \
     unzip \
     zsh \
+  && python3 --version | grep -Eq '^Python 3\.11\.' \
   && rm -rf /var/lib/apt/lists/*
+
+# Default interpreter is Bookworm python3. Add packages in requirements.txt.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt \
+  && rm /tmp/requirements.txt \
+  && python3 -c 'import click, pydantic, pydantic_settings, requests'
 
 RUN npm install -g \
     --allow-scripts=openclaw \
@@ -35,10 +43,13 @@ RUN mkdir -p /opt/openclaw-plugin-seed \
      openclaw plugins install @openclaw/groq-provider@2026.9.7 \
   && OPENCLAW_STATE_DIR=/opt/openclaw-plugin-seed \
      openclaw plugins install @openclaw/perplexity-plugin@2026.9.7 \
+  && OPENCLAW_STATE_DIR=/opt/openclaw-plugin-seed \
+     openclaw plugins install @openclaw/duckduckgo-plugin@2026.9.7 \
   && printf '%s\n' \
     '@openclaw/deepinfra-provider@2026.9.7' \
     '@openclaw/groq-provider@2026.9.7' \
     '@openclaw/perplexity-plugin@2026.9.7' \
+    '@openclaw/duckduckgo-plugin@2026.9.7' \
     > /opt/openclaw-plugin-seed/STAMP \
   && find /opt/openclaw-plugin-seed -mindepth 1 -maxdepth 1 \
     ! -name npm ! -name STAMP -exec rm -rf {} + \

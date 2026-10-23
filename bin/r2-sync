@@ -1,35 +1,37 @@
-#!/bin/bash
-# Two-way sync between the OpenClaw workspace and a Cloudflare R2 bucket
-# (rclone bisync), with git snapshots of the workspace for rollback.
-#
-# Watchdog mode: triggers on file changes in the workspace, with a quiet period
-# to batch rapid changes, plus a periodic sync so remote-side edits get pulled.
-#
-# Opt-in: does nothing unless R2_BUCKET is set.
-#
-# Env:
-#   R2_BUCKET             bucket name (required to enable)
-#   R2_ACCESS_KEY_ID      R2 API token access key (required)
-#   R2_SECRET_ACCESS_KEY  R2 API token secret (required)
-#   R2_ACCOUNT_ID         Cloudflare account id (required unless R2_ENDPOINT set)
-#   R2_ENDPOINT           override endpoint URL
-#   R2_PREFIX             optional key prefix inside the bucket
-#   R2_SYNC_INTERVAL      max seconds between syncs (default 120); a sync also
-#                         fires as soon as the workspace changes
-#   R2_SYNC_DEBOUNCE      quiet period after last file change before syncing (default 5)
-#   R2_GIT_REMOTE         optional private git remote URL; snapshots are pushed to it
-#   R2_GIT_SNAPSHOTS      enable/disable git snapshots (default true)
-#
-# Pause: `touch /data/.r2-sync-paused` (remove the file to resume).
-# Force a merge on the next cycle: `r2-sync --resync` (newest file wins).
-# If a sync is already running, that process does the resync; this one exits.
+#!/usr/bin/env python3
+"""Two-way sync between the OpenClaw workspace and a Cloudflare R2 bucket.
 
-set -u
+Watchdog mode (no arguments) watches the workspace, waits out a quiet period,
+and also syncs at least every R2_SYNC_INTERVAL so remote edits are pulled.
+Opt-in: does nothing unless R2_BUCKET is set.
 
-usage() {
-  cat <<'EOF'
-usage: r2-sync [--resync] [-h|--help]
+  r2-sync push     Make R2 match the workspace, including deletes.
+  r2-sync pull     Make the workspace match R2, including deletes.
+  r2-sync resync   Merge both sides; newest file wins.
 
+Those three run in the foreground, even when /data/.r2-sync-paused exists,
+and exit with the operation's status. The pause file still skips unattended
+cycles.
+"""
+
+import argparse
+import json
+import os
+import queue
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import StrEnum
+from types import FrameType
+
+DESCRIPTION = """\
 Two-way sync between the OpenClaw workspace and a Cloudflare R2 bucket
 (rclone bisync), with git snapshots of the workspace for rollback.
 
@@ -37,13 +39,24 @@ With no arguments, runs until stopped. A sync starts shortly after the
 workspace changes, and at least every R2_SYNC_INTERVAL seconds so edits
 made on the R2 side are pulled down. Does nothing unless R2_BUCKET is set.
 
-Options:
-  --resync    Merge the local workspace and R2 on the next cycle
-              (newest file wins). If a sync is already running, that
-              process does the resync and this command exits.
-  -h, --help  Show this help.
+push, pull, and resync each run one operation and exit. They do not stay
+in the watch loop. If a worker is already running they wait for it; otherwise
+they start one. push makes R2 match the workspace, including deletes. pull
+makes the workspace match R2, including deletes. resync merges both sides
+and the newest file wins. push and pull skip the 25% delete cap; resync
+and unattended cycles keep it.
+"""
 
-Pause and resume:
+EPILOG = """\
+Commands:
+  r2-sync           Watch the workspace and two-way sync until stopped.
+  r2-sync push      Make R2 match the workspace, including deletes.
+  r2-sync pull      Make the workspace match R2, including deletes.
+  r2-sync resync    Merge both sides; newest file wins.
+
+push, pull, and resync run even when the pause file exists. A queued
+push, pull, or resync starts without waiting out R2_SYNC_INTERVAL.
+Pause still skips cycles of the unattended job:
   touch /data/.r2-sync-paused
   rm /data/.r2-sync-paused
 
@@ -66,419 +79,1384 @@ Environment:
                         Workspace to sync (default $OPENCLAW_STATE_DIR/workspace).
 
 Logs go to stdout and to r2-sync.log in the state directory.
-EOF
-}
+"""
 
-FORCE_RESYNC=0
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --resync) FORCE_RESYNC=1 ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "r2-sync: unknown argument: $1" >&2
-      echo "Try 'r2-sync --help' for more information." >&2
-      exit 2
-      ;;
-  esac
-  shift
-done
+GIT_EXCLUDES = ("node_modules/", "*.tmp", ".obsidian/", ".trash/", ".DS_Store")
+LOG_LIMIT = 1048576
+INOTIFY_EXCLUDE = r"(^|/)(\.git|node_modules|__pycache__|\.obsidian|\.trash)/"
 
-if [ -z "${R2_BUCKET:-}" ]; then
-  exit 0
-fi
 
-DATA_DIR="${R2_DATA_DIR:-/data}"
-STATE_DIR="${OPENCLAW_STATE_DIR:-$DATA_DIR/.openclaw}"
-WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$STATE_DIR/workspace}"
-INTERVAL="${R2_SYNC_INTERVAL:-120}"
-DEBOUNCE="${R2_SYNC_DEBOUNCE:-5}"
-SNAPSHOTS="${R2_GIT_SNAPSHOTS:-true}"
-PREFIX="${R2_PREFIX:-}"
-PREFIX="${PREFIX#/}"
-PREFIX="${PREFIX%/}"
-PAUSE_FLAG="$DATA_DIR/.r2-sync-paused"
-WORKDIR="$DATA_DIR/.rclone-bisync"
-PIDFILE="$WORKDIR/r2-sync.pid"
-RESYNC_REQUEST="$WORKDIR/resync-request"
-LOG_FILE="$STATE_DIR/r2-sync.log"
-FILTERS_FILE="$WORKDIR/filters.txt"
+class BisyncMode(StrEnum):
+    NORMAL = "normal"
+    RESYNC = "resync"
+    PUSH = "push"
+    PULL = "pull"
 
-mkdir -p "$STATE_DIR" "$WORKSPACE_DIR" "$WORKDIR"
 
-log() {
-  local line
-  line="[r2-sync] $(date -u +%FT%TZ) $*"
-  echo "$line"
-  echo "$line" >> "$LOG_FILE" 2>/dev/null || true
-}
+EXPLICIT_OPS = frozenset({"push", "pull", "resync"})
 
-# Keep the log from growing without bound (~1MB).
-rotate_log() {
-  if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 1048576 ]; then
-    tail -n 2000 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
-  fi
-}
 
-if [ -z "${R2_ACCESS_KEY_ID:-}" ] || [ -z "${R2_SECRET_ACCESS_KEY:-}" ]; then
-  log "R2_BUCKET is set but R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are missing; sync disabled"
-  exit 0
-fi
+class Kind(StrEnum):
+    EXPLICIT = "explicit"
+    CHANGE = "change"
+    DUE = "due"
+    STOP = "stop"
+    WATCH_LOST = "watch-lost"
 
-ENDPOINT="${R2_ENDPOINT:-}"
-if [ -z "$ENDPOINT" ]; then
-  if [ -z "${R2_ACCOUNT_ID:-}" ]; then
-    log "Set R2_ACCOUNT_ID (or R2_ENDPOINT); sync disabled"
-    exit 0
-  fi
-  ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-fi
 
-# rclone remote "r2" configured purely from env (no config file).
-export RCLONE_CONFIG_R2_TYPE=s3
-export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
-export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
-export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
-export RCLONE_CONFIG_R2_ENDPOINT="$ENDPOINT"
-export RCLONE_CONFIG_R2_REGION=auto
-export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
-export RCLONE_CONFIG_R2_ACL=private
+# Per container. Not on the volume: the queue does not survive a restart.
+SOCKET_PATH = "/tmp/r2-sync.sock"
+INITIAL_FD_ENV = "R2_SYNC_INITIAL_FD"
 
-REMOTE="r2:${R2_BUCKET}"
-[ -n "$PREFIX" ] && REMOTE="${REMOTE}/${PREFIX}"
 
-# Atomic replace, and only when the rules actually change. Rewriting the same
-# bytes still bumps mtime; a partial write would change the filters hash and
-# force a bisync --resync.
-write_filters() {
-  local tmp
-  tmp=$(mktemp "$WORKDIR/filters.XXXXXX")
-  {
-    echo "# Generated by r2-sync $(date -u +%FT%TZ)"
-    echo "# Static defaults (lowest priority):"
-    echo "- .git/**"
-    echo "- node_modules/**"
-    echo "- .obsidian/**"
-    echo "- .trash/**"
-    echo "- _remotely-save-metadata-on-remote.json"
-    echo "- .DS_Store"
-    echo "- *.tmp"
-    echo ""
-    echo "# Per-directory .r2-sync-ignore files (highest priority, deepest first):"
+@dataclass(frozen=True, slots=True)
+class Config:
+    data_dir: str
+    state_dir: str
+    workspace_dir: str
+    interval: int
+    debounce: int
+    snapshots: bool
+    remote: str
+    pause_flag: str
+    workdir: str
+    resync_request: str
+    log_file: str
+    filters_file: str
+    git_remote: str
 
-    # Find all .r2-sync-ignore files, sort by depth (deepest first) so
-    # nested rules override parent rules (like .gitignore)
-    local ignore_files=()
-    while IFS= read -r -d '' file; do
-      ignore_files+=("$file")
-    done < <(find "$WORKSPACE_DIR" -type f -name '.r2-sync-ignore' -print0 2>/dev/null | sort -z -t'/' -k2 -r)
 
-    for ignore_file in "${ignore_files[@]}"; do
-      local rel_dir
-      rel_dir="${ignore_file#$WORKSPACE_DIR/}"
-      # Remove the filename from the path
-      rel_dir="${rel_dir%.r2-sync-ignore}"
-      rel_dir="${rel_dir%/}"
-      if [ -z "$rel_dir" ]; then
-        echo "# From: .r2-sync-ignore (workspace root)"
-      else
-        echo "# From: $rel_dir/.r2-sync-ignore"
-      fi
-      while IFS= read -r line || [ -n "$line" ]; do
-        # Skip empty lines and comments
-        case "$line" in
-          ''|'#'*) continue ;;
-        esac
-        # Translate .gitignore-style to rclone filter format
-        local pattern="$line"
-        # Handle negation
-        if [[ "$pattern" == "!"* ]]; then
-          pattern="${pattern#!}"
-          if [ -n "$rel_dir" ]; then
-            echo "+ $rel_dir/$pattern"
-          else
-            echo "+ $pattern"
-          fi
-        else
-          # Directory patterns need /** for recursive
-          if [[ "$pattern" == */ ]]; then
-            # Strip trailing slash, then add /**
-            pattern="${pattern%/}/**"
-          fi
-          if [ -n "$rel_dir" ]; then
-            echo "- ${rel_dir}/${pattern}"
-          else
-            echo "- ${pattern}"
-          fi
-        fi
-      done < "$ignore_file"
-      echo ""
-    done
-  } > "$tmp"
+def _inotify_available() -> bool:
+    return shutil.which("inotifywait") is not None
 
-  if [ -f "$FILTERS_FILE" ] && cmp -s "$tmp" "$FILTERS_FILE"; then
-    rm -f "$tmp"
-  else
-    mv "$tmp" "$FILTERS_FILE"
-  fi
-}
-write_filters
 
-# --- git snapshots ----------------------------------------------------------
+@dataclass(slots=True)
+class Item:
+    id: str
+    op: str
+    explicit: bool
+    rc: int = 1
+    conn: socket.socket | None = None
+    reader: object | None = None
+    done: threading.Event | None = None
 
-GIT=(git -C "$WORKSPACE_DIR" -c user.name="openclaw-r2-sync" -c user.email="r2-sync@localhost")
 
-git_init() {
-  if [ ! -d "$WORKSPACE_DIR/.git" ]; then
-    "${GIT[@]}" init -q -b main >/dev/null 2>&1 || "${GIT[@]}" init -q >/dev/null 2>&1
-    log "initialised git repo in $WORKSPACE_DIR"
-  fi
-  # Local-only ignores: kept out of the synced tree.
-  mkdir -p "$WORKSPACE_DIR/.git/info"
-  for pat in 'node_modules/' '*.tmp' '.obsidian/' '.trash/' '.DS_Store'; do
-    grep -qxF "$pat" "$WORKSPACE_DIR/.git/info/exclude" 2>/dev/null \
-      || echo "$pat" >> "$WORKSPACE_DIR/.git/info/exclude"
-  done
-  if [ -n "${R2_GIT_REMOTE:-}" ]; then
-    if "${GIT[@]}" remote get-url r2backup >/dev/null 2>&1; then
-      "${GIT[@]}" remote set-url r2backup "$R2_GIT_REMOTE"
-    else
-      "${GIT[@]}" remote add r2backup "$R2_GIT_REMOTE"
-    fi
-  fi
-}
+@dataclass(slots=True)
+class Event:
+    kind: Kind
+    item: Item | None = None
 
-git_snapshot() {
-  local label="$1"
-  [ "$SNAPSHOTS" = "true" ] || return 0
-  "${GIT[@]}" add -A >/dev/null 2>&1 || return 0
-  if ! "${GIT[@]}" diff --cached --quiet 2>/dev/null; then
-    if "${GIT[@]}" commit -q -m "$label $(date -u +%FT%TZ)" >/dev/null 2>&1; then
-      log "git snapshot: $label"
-      if [ -n "${R2_GIT_REMOTE:-}" ]; then
-        # Output suppressed: the remote URL may contain a token.
-        "${GIT[@]}" push -q r2backup HEAD:refs/heads/main >/dev/null 2>&1 \
-          || log "git push to R2_GIT_REMOTE failed (will retry on next snapshot)"
-      fi
-    fi
-  fi
-  "${GIT[@]}" gc --auto -q >/dev/null 2>&1 || true
-}
 
-# --- bisync -----------------------------------------------------------------
+@dataclass(slots=True)
+class State:
+    force_resync: bool
+    stop: bool = False
+    accepting: bool = True
+    watch: bool = field(default_factory=_inotify_available)
+    wait_proc: subprocess.Popen[bytes] | None = None
+    admit: threading.Lock = field(default_factory=threading.Lock)
 
-BISYNC_COMMON=(
-  --workdir "$WORKDIR"
-  --filters-file "$FILTERS_FILE"
-  --conflict-resolve newer
-  --conflict-loser num
-  --resilient
-  --recover
-  --max-lock 10m
-  --max-delete 25
-  --create-empty-src-dirs
-  --fast-list
-)
 
-# Lock body is either a bare PID (briefly, at create) or JSON renewed by
-# rclone: {"PID":"123",...}. Default locks never expire, so a killed bisync
-# blocks every later run until the file is removed.
-lock_pid() {
-  local file="$1" pid
-  pid=$(sed -n 's/.*"PID":"\([0-9][0-9]*\)".*/\1/p' "$file" 2>/dev/null | tail -n 1)
-  if [ -z "$pid" ] && grep -qxE '[0-9]+' "$file" 2>/dev/null; then
-    pid=$(tr -cd '0-9' < "$file")
-  fi
-  printf '%s' "$pid"
-}
+# The process that binds SOCKET_PATH is the only rclone runner. Foreground
+# commands submit one JSON line on that socket and wait for the reply.
+CURRENT: State | None = None
 
-# Drop a lock whose rclone is gone. A live bisync keeps it.
-# Returns 1 when a bisync is still running.
-release_stale_lock() {
-  local lock pid args locks=()
-  shopt -s nullglob
-  locks=("$WORKDIR"/*.lck)
-  shopt -u nullglob
-  for lock in "${locks[@]}"; do
-    pid=$(lock_pid "$lock")
-    args=""
-    if [ -n "$pid" ]; then
-      args=$(ps -p "$pid" -o args= 2>/dev/null || true)
-    fi
-    case "$args" in
-      *rclone*)
-        case "$args" in
-          *"<defunct>"*) ;;
-          *)
-            log "bisync still running (pid $pid); leaving $(basename "$lock")"
+
+def stamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def log_line(log_file: str, message: str) -> None:
+    line = f"[r2-sync] {stamp()} {message}"
+    print(line, flush=True)
+    try:
+        with open(log_file, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+def log(cfg: Config, message: str) -> None:
+    log_line(cfg.log_file, message)
+
+
+def rotate_log(cfg: Config) -> None:
+    try:
+        size = os.path.getsize(cfg.log_file)
+    except OSError:
+        return
+    if size <= LOG_LIMIT:
+        return
+    try:
+        with open(cfg.log_file, "rb") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return
+    tail = b"".join(lines[-2000:])
+    tmp = cfg.log_file + ".tmp"
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(tail)
+        os.replace(tmp, cfg.log_file)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+@dataclass(frozen=True, slots=True)
+class Env:
+    bucket: str
+    access_key_id: str
+    secret_access_key: str
+    endpoint: str | None
+    prefix: str
+    interval: int
+    debounce: int
+    snapshots: bool
+    git_remote: str
+    data_dir: str
+    state_dir: str
+    workspace_dir: str
+
+
+def read_env() -> Env:
+    """Read every r2-sync environment variable."""
+
+    def text(name: str, default: str = "") -> str:
+        return os.environ.get(name, default)
+
+    def integer(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            value = int(raw, 10)
+        except ValueError:
+            return default
+        if value < 0:
+            return default
+        return value
+
+    data_dir = text("R2_DATA_DIR", "/data")
+    state_dir = text("OPENCLAW_STATE_DIR", os.path.join(data_dir, ".openclaw"))
+    workspace_dir = text("OPENCLAW_WORKSPACE_DIR", os.path.join(state_dir, "workspace"))
+    endpoint = text("R2_ENDPOINT")
+    if not endpoint:
+        account = text("R2_ACCOUNT_ID")
+        endpoint = f"https://{account}.r2.cloudflarestorage.com" if account else ""
+    prefix = text("R2_PREFIX")
+    if prefix.startswith("/"):
+        prefix = prefix[1:]
+    if prefix.endswith("/"):
+        prefix = prefix[:-1]
+    return Env(
+        bucket=text("R2_BUCKET"),
+        access_key_id=text("R2_ACCESS_KEY_ID"),
+        secret_access_key=text("R2_SECRET_ACCESS_KEY"),
+        endpoint=endpoint or None,
+        prefix=prefix,
+        interval=integer("R2_SYNC_INTERVAL", 120),
+        debounce=integer("R2_SYNC_DEBOUNCE", 5),
+        snapshots=text("R2_GIT_SNAPSHOTS", "true") == "true",
+        git_remote=text("R2_GIT_REMOTE"),
+        data_dir=data_dir,
+        state_dir=state_dir,
+        workspace_dir=workspace_dir,
+    )
+
+
+def build_config(env: Env) -> Config | None:
+    os.makedirs(env.state_dir, exist_ok=True)
+    os.makedirs(env.workspace_dir, exist_ok=True)
+    workdir = os.path.join(env.data_dir, ".rclone-bisync")
+    os.makedirs(workdir, exist_ok=True)
+    log_file = os.path.join(env.state_dir, "r2-sync.log")
+
+    if not env.access_key_id or not env.secret_access_key:
+        log_line(
+            log_file,
+            "R2_BUCKET is set but R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are missing; sync disabled",
+        )
+        return None
+    if env.endpoint is None:
+        log_line(log_file, "Set R2_ACCOUNT_ID (or R2_ENDPOINT); sync disabled")
+        return None
+
+    os.environ["RCLONE_CONFIG_R2_TYPE"] = "s3"
+    os.environ["RCLONE_CONFIG_R2_PROVIDER"] = "Cloudflare"
+    os.environ["RCLONE_CONFIG_R2_ACCESS_KEY_ID"] = env.access_key_id
+    os.environ["RCLONE_CONFIG_R2_SECRET_ACCESS_KEY"] = env.secret_access_key
+    os.environ["RCLONE_CONFIG_R2_ENDPOINT"] = env.endpoint
+    os.environ["RCLONE_CONFIG_R2_REGION"] = "auto"
+    os.environ["RCLONE_CONFIG_R2_NO_CHECK_BUCKET"] = "true"
+    os.environ["RCLONE_CONFIG_R2_ACL"] = "private"
+
+    remote = f"r2:{env.bucket}"
+    if env.prefix:
+        remote = f"{remote}/{env.prefix}"
+    return Config(
+        data_dir=env.data_dir,
+        state_dir=env.state_dir,
+        workspace_dir=env.workspace_dir,
+        interval=env.interval,
+        debounce=env.debounce,
+        snapshots=env.snapshots,
+        remote=remote,
+        pause_flag=os.path.join(env.data_dir, ".r2-sync-paused"),
+        workdir=workdir,
+        resync_request=os.path.join(workdir, "resync-request"),
+        log_file=log_file,
+        filters_file=os.path.join(workdir, "filters.txt"),
+        git_remote=env.git_remote,
+    )
+
+
+def ignore_sort_key(path: str) -> str:
+    # Match `sort -t/ -k2 -r`: the text after the first slash, reversed.
+    slash = path.find("/")
+    if slash == -1:
+        return path
+    return path[slash + 1 :]
+
+
+def find_ignore_files(workspace: str) -> list[str]:
+    found: list[str] = []
+    for root, _dirs, files in os.walk(workspace):
+        if ".r2-sync-ignore" not in files:
+            continue
+        path = os.path.join(root, ".r2-sync-ignore")
+        if os.path.isfile(path) and not os.path.islink(path):
+            found.append(path)
+    found.sort(key=ignore_sort_key, reverse=True)
+    return found
+
+
+def render_filters(workspace: str) -> str:
+    parts = [
+        "# Generated by r2-sync\n",
+        "# Static defaults (lowest priority):\n",
+        "- .git/**\n",
+        "- node_modules/**\n",
+        "- .obsidian/**\n",
+        "- .trash/**\n",
+        "- _remotely-save-metadata-on-remote.json\n",
+        "- .DS_Store\n",
+        "- *.tmp\n",
+        "\n",
+        "# Per-directory .r2-sync-ignore files (highest priority, deepest first):\n",
+    ]
+    for ignore in find_ignore_files(workspace):
+        rel = os.path.relpath(ignore, workspace)
+        rel_dir = rel[: -len(".r2-sync-ignore")].rstrip("/")
+        if rel_dir == "":
+            parts.append("# From: .r2-sync-ignore (workspace root)\n")
+        else:
+            parts.append(f"# From: {rel_dir}/.r2-sync-ignore\n")
+        try:
+            with open(ignore, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            parts.append("\n")
+            continue
+        for line in text.splitlines():
+            if line == "" or line.startswith("#"):
+                continue
+            pattern = line
+            if pattern.startswith("!"):
+                pattern = pattern[1:]
+                sign = "+ "
+            else:
+                sign = "- "
+                if pattern.endswith("/"):
+                    pattern = pattern[:-1] + "/**"
+            if rel_dir:
+                parts.append(f"{sign}{rel_dir}/{pattern}\n")
+            else:
+                parts.append(f"{sign}{pattern}\n")
+        parts.append("\n")
+    return "".join(parts)
+
+
+def write_filters(cfg: Config) -> None:
+    # Header stays stable. A new timestamp each run would change the bisync
+    # filters hash and force a resync on every start.
+    body = render_filters(cfg.workspace_dir)
+    try:
+        with open(cfg.filters_file, encoding="utf-8") as handle:
+            current = handle.read()
+    except OSError:
+        current = None
+    if current == body:
+        return
+    fd, tmp = tempfile.mkstemp(prefix="filters.", dir=cfg.workdir)
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(body)
+        os.replace(tmp, cfg.filters_file)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def git(cfg: Config, *args: str) -> int:
+    cmd = [
+        "git",
+        "-C",
+        cfg.workspace_dir,
+        "-c",
+        "user.name=openclaw-r2-sync",
+        "-c",
+        "user.email=r2-sync@localhost",
+        *args,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        return 127
+    return proc.returncode
+
+
+def git_init(cfg: Config) -> None:
+    git_dir = os.path.join(cfg.workspace_dir, ".git")
+    if not os.path.isdir(git_dir):
+        if git(cfg, "init", "-q", "-b", "main") != 0:
+            git(cfg, "init", "-q")
+        log(cfg, f"initialised git repo in {cfg.workspace_dir}")
+    info = os.path.join(cfg.workspace_dir, ".git", "info")
+    try:
+        os.makedirs(info, exist_ok=True)
+        exclude = os.path.join(info, "exclude")
+        existing: list[str] = []
+        if os.path.isfile(exclude):
+            with open(exclude, encoding="utf-8", errors="replace") as handle:
+                existing = handle.read().splitlines()
+        with open(exclude, "a", encoding="utf-8") as handle:
+            for pat in GIT_EXCLUDES:
+                if pat not in existing:
+                    handle.write(pat + "\n")
+    except OSError:
+        pass
+    if cfg.git_remote:
+        if git(cfg, "remote", "get-url", "r2backup") == 0:
+            git(cfg, "remote", "set-url", "r2backup", cfg.git_remote)
+        else:
+            git(cfg, "remote", "add", "r2backup", cfg.git_remote)
+
+
+def git_snapshot(cfg: Config, label: str) -> None:
+    if not cfg.snapshots:
+        return
+    if git(cfg, "add", "-A") != 0:
+        return
+    if git(cfg, "diff", "--cached", "--quiet") == 0:
+        return
+    if git(cfg, "commit", "-q", "-m", f"{label} {stamp()}") == 0:
+        log(cfg, f"git snapshot: {label}")
+        if cfg.git_remote:
+            pushed = git(cfg, "push", "-q", "r2backup", "HEAD:refs/heads/main")
+            if pushed != 0:
+                log(
+                    cfg,
+                    "git push to R2_GIT_REMOTE failed (will retry on next snapshot)",
+                )
+    git(cfg, "gc", "--auto", "-q")
+
+
+def process_output(pid: int, column: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", f"{column}="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def process_args(pid: int) -> str:
+    return process_output(pid, "args")
+
+
+def process_stat(pid: int) -> str:
+    return process_output(pid, "stat")
+
+
+def bisync_still_running(pid: int) -> bool:
+    args = process_args(pid)
+    if not args or "<defunct>" in args:
+        return False
+    if process_stat(pid).startswith("Z"):
+        return False
+    return "rclone" in args
+
+
+def lock_pid(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return ""
+    found: list[str] = []
+    marker = '"PID":"'
+    start = 0
+    while True:
+        at = text.find(marker, start)
+        if at == -1:
+            break
+        at += len(marker)
+        end = at
+        while end < len(text) and text[end].isdigit():
+            end += 1
+        if end > at and end < len(text) and text[end] == '"':
+            found.append(text[at:end])
+        start = end
+    if found:
+        return found[-1]
+    stripped = text.strip()
+    if stripped.isdigit():
+        return stripped
+    return ""
+
+
+def release_stale_lock(cfg: Config) -> bool:
+    try:
+        names = os.listdir(cfg.workdir)
+    except OSError:
+        return True
+    for name in sorted(names):
+        if not name.endswith(".lck"):
+            continue
+        path = os.path.join(cfg.workdir, name)
+        if not os.path.isfile(path):
+            continue
+        pid_text = lock_pid(path)
+        pid = int(pid_text) if pid_text.isdigit() else None
+        if pid and bisync_still_running(pid):
+            log(cfg, f"bisync still running (pid {pid}); leaving {name}")
+            return False
+        log(cfg, f"removing stale bisync lock {name}")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return True
+
+
+def have_listings(cfg: Config) -> bool:
+    try:
+        names = os.listdir(cfg.workdir)
+    except OSError:
+        return False
+    return any(name.endswith(".lst") and not name.startswith(".") for name in names)
+
+
+def bisync_argv(cfg: Config, mode: BisyncMode) -> list[str]:
+    cmd = [
+        "rclone",
+        "bisync",
+        cfg.workspace_dir,
+        cfg.remote,
+        "--workdir",
+        cfg.workdir,
+        "--filters-file",
+        cfg.filters_file,
+        "--conflict-resolve",
+        "newer",
+        "--conflict-loser",
+        "num",
+        "--resilient",
+        "--recover",
+        "--max-lock",
+        "10m",
+        "--create-empty-src-dirs",
+        "--fast-list",
+    ]
+    # Push and pull skip the 25% cap. Two-way cycles and resync keep it.
+    if mode is BisyncMode.PUSH:
+        cmd.extend(["--force", "--resync-mode", "path1"])
+    elif mode is BisyncMode.PULL:
+        cmd.extend(["--force", "--resync-mode", "path2"])
+    else:
+        cmd.extend(["--max-delete", "25"])
+        if mode is BisyncMode.RESYNC:
+            cmd.extend(["--resync", "--resync-mode", "newer"])
+    return cmd
+
+
+def sync_argv(cfg: Config, src: str, dst: str) -> list[str]:
+    return [
+        "rclone",
+        "sync",
+        src,
+        dst,
+        "--filter-from",
+        cfg.filters_file,
+        "--create-empty-src-dirs",
+        "--fast-list",
+    ]
+
+
+def run_rclone(cfg: Config, cmd: list[str], label: str) -> int:
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        log(cfg, f"{label} exited 127: rclone not found")
+        return 127
+    if proc.returncode != 0:
+        tail = " ".join(proc.stdout.splitlines()[-8:])
+        log(cfg, f"{label} exited {proc.returncode}: {tail}")
+    return proc.returncode
+
+
+def run_bisync(cfg: Config, mode: BisyncMode) -> int:
+    if not release_stale_lock(cfg):
+        return 2
+    if mode is BisyncMode.RESYNC:
+        log(cfg, "running resync (merging local and R2, newest wins)")
+    elif mode is BisyncMode.PUSH:
+        log(cfg, "refreshing bisync listings from the workspace")
+    elif mode is BisyncMode.PULL:
+        log(cfg, "refreshing bisync listings from R2")
+    return run_rclone(cfg, bisync_argv(cfg, mode), "bisync")
+
+
+def run_authoritative(cfg: Config, mode: BisyncMode) -> int:
+    # bisync --resync-mode copies files that exist only on the other side, so
+    # it cannot delete them. sync applies those deletes; the resync rewrites
+    # listings so the next two-way cycle keeps this tree.
+    if mode is BisyncMode.PUSH:
+        src, dst = cfg.workspace_dir, cfg.remote
+        log(cfg, "push: making R2 match the workspace, including deletes")
+    elif mode is BisyncMode.PULL:
+        src, dst = cfg.remote, cfg.workspace_dir
+        log(cfg, "pull: making the workspace match R2, including deletes")
+    else:
+        log(cfg, f"unknown authoritative mode: {mode}")
+        return 2
+    if not release_stale_lock(cfg):
+        return 2
+    rc = run_rclone(cfg, sync_argv(cfg, src, dst), "sync")
+    if rc != 0:
+        return rc
+    return run_bisync(cfg, mode)
+
+
+def run_twoway(cfg: Config, state: State) -> int:
+    if os.path.exists(cfg.pause_flag):
+        log(cfg, f"paused ({cfg.pause_flag} exists); skipping")
+        return 0
+    if os.path.exists(cfg.resync_request):
+        try:
+            os.remove(cfg.resync_request)
+        except OSError:
+            pass
+        state.force_resync = True
+        log(cfg, "resync requested")
+    git_snapshot(cfg, "pre-sync")
+    if state.force_resync or not have_listings(cfg):
+        rc = run_bisync(cfg, BisyncMode.RESYNC)
+        if rc != 2:
+            state.force_resync = False
+    else:
+        rc = run_bisync(cfg, BisyncMode.NORMAL)
+        if rc == 7:
+            rc = run_bisync(cfg, BisyncMode.RESYNC)
+    if rc == 2:
+        return 0
+    git_snapshot(cfg, "post-sync")
+    return 0
+
+
+def run_explicit(cfg: Config, _state: State, item: Item) -> int:
+    # The pause file skips unattended cycles only. These still run.
+    op = item.op
+    if op not in EXPLICIT_OPS:
+        log(cfg, f"unknown queue op: {op}")
+        return 2
+    git_snapshot(cfg, f"pre-{op}")
+    if op == "resync":
+        rc = run_bisync(cfg, BisyncMode.RESYNC)
+    elif op == "push":
+        rc = run_authoritative(cfg, BisyncMode.PUSH)
+    else:
+        rc = run_authoritative(cfg, BisyncMode.PULL)
+    if rc != 2:
+        git_snapshot(cfg, f"post-{op}")
+    return rc
+
+
+class Deadlines:
+    """Change debounce and the sync interval, each a daemon timer."""
+
+    def __init__(self, events: queue.Queue[Event]) -> None:
+        self._events = events
+        self._lock = threading.Lock()
+        self._change: threading.Timer | None = None
+        self._interval: threading.Timer | None = None
+        self._change_gen = 0
+        self._interval_gen = 0
+        self._stopped = False
+
+    def _start(self, delay: float, gen: int, kind: str) -> threading.Timer:
+        timer = threading.Timer(delay, self._fire, args=(gen, kind))
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    def _fire(self, gen: int, kind: str) -> None:
+        with self._lock:
+            if self._stopped:
+                return
+            if kind == "change" and gen != self._change_gen:
+                return
+            if kind == "interval" and gen != self._interval_gen:
+                return
+        self._events.put(Event(Kind.DUE))
+
+    def note_change(self, debounce: float) -> None:
+        with self._lock:
+            if self._stopped:
+                return
+            self._change_gen += 1
+            if self._change is not None:
+                self._change.cancel()
+            self._change = self._start(debounce, self._change_gen, "change")
+
+    def arm_interval(self, seconds: float, *, due_now: bool = False) -> None:
+        with self._lock:
+            if self._stopped:
+                return
+            self._interval_gen += 1
+            if self._interval is not None:
+                self._interval.cancel()
+            delay = 0.0 if due_now else float(seconds)
+            self._interval = self._start(delay, self._interval_gen, "interval")
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            self._change_gen += 1
+            self._interval_gen += 1
+            if self._change is not None:
+                self._change.cancel()
+                self._change = None
+            if self._interval is not None:
+                self._interval.cancel()
+                self._interval = None
+
+
+def socket_reader(conn: socket.socket):
+    return conn.makefile("r", encoding="utf-8", newline="\n")
+
+
+def parse_request(line: str) -> Item | None:
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    op = data.get("op")
+    if not isinstance(op, str) or op == "":
+        return None
+    item_id = data.get("id")
+    if not isinstance(item_id, str) or item_id == "":
+        item_id = uuid.uuid4().hex
+    explicit = data.get("explicit", True)
+    if not isinstance(explicit, bool):
+        explicit = True
+    return Item(id=item_id, op=op, explicit=explicit)
+
+
+def parse_rc(line: str) -> int:
+    if line == "":
+        return 1
+    try:
+        body = json.loads(line)
+    except json.JSONDecodeError:
+        return 1
+    if not isinstance(body, dict):
+        return 1
+    rc = body.get("rc")
+    if isinstance(rc, bool) or not isinstance(rc, int):
+        return 1
+    return rc
+
+
+def write_reply(conn: socket.socket, item: Item) -> None:
+    body = json.dumps({"id": item.id, "op": item.op, "rc": item.rc}) + "\n"
+    try:
+        conn.sendall(body.encode())
+    except OSError:
+        pass
+
+
+def close_item_conn(item: Item) -> None:
+    reader = item.reader
+    conn = item.conn
+    item.reader = None
+    item.conn = None
+    # Closing the makefile closes the socket.
+    if reader is not None:
+        try:
+            reader.close()
+        except OSError:
+            pass
+        return
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except OSError:
+        pass
+
+
+def reply_when_done(item: Item) -> None:
+    done = item.done
+    if done is None:
+        return
+    done.wait()
+    conn = item.conn
+    if conn is not None:
+        write_reply(conn, item)
+    close_item_conn(item)
+
+
+def close_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def socket_is_live() -> bool | None:
+    """True when a worker is listening, False when the socket is absent or stale."""
+    if not os.path.exists(SOCKET_PATH):
+        return False
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(2)
+    try:
+        conn.connect(SOCKET_PATH)
+        return True
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        return None
+    finally:
+        conn.close()
+
+
+def _with_bind_lock(body):
+    # Serializes unlink-and-bind. The listening socket is the singleton.
+    import fcntl
+
+    lock_fd = os.open("/tmp/r2-sync.bind.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return body()
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        close_fd(lock_fd)
+
+
+def bind_listener() -> socket.socket | None:
+    def attempt() -> socket.socket | None:
+        for _ in range(3):
+            live = socket_is_live()
+            if live is True:
+                return None
+            if live is None:
+                continue
+            try:
+                os.unlink(SOCKET_PATH)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(SOCKET_PATH)
+                os.chmod(SOCKET_PATH, 0o600)
+                listener.listen(8)
+            except OSError:
+                listener.close()
+                continue
+            return listener
+        if socket_is_live() is True:
+            return None
+        return None
+
+    return _with_bind_lock(attempt)
+
+
+def release_listener(listener: socket.socket) -> None:
+    def attempt() -> None:
+        try:
+            listener.close()
+        except OSError:
+            pass
+        # Path inodes for Unix sockets do not match the fd on every OS.
+        # A connect that fails means this path is not a live worker.
+        if socket_is_live() is not False:
+            return
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+
+    _with_bind_lock(attempt)
+
+
+def enqueue_item(state: State, events: queue.Queue[Event], item: Item) -> bool:
+    with state.admit:
+        if not state.accepting:
+            return False
+        events.put(Event(Kind.EXPLICIT, item=item))
+        return True
+
+
+def run_item(cfg: Config, state: State, item: Item) -> int:
+    rc = 1
+    try:
+        if item.explicit:
+            rc = run_explicit(cfg, state, item)
+        elif item.op == "twoway":
+            rc = run_twoway(cfg, state)
+        else:
+            log(cfg, f"unknown queue op: {item.op}")
+            rc = 2
+    except Exception as exc:
+        log(cfg, f"queue item failed: {exc}")
+        rc = 1
+    finally:
+        item.rc = rc
+        if item.done is not None:
+            item.done.set()
+    return rc
+
+
+def apply_event(cfg: Config, state: State, deadlines: Deadlines, ev: Event) -> bool:
+    if ev.kind is Kind.STOP:
+        return True
+    if ev.kind is Kind.EXPLICIT:
+        if ev.item is not None:
+            run_item(cfg, state, ev.item)
+        return state.stop
+    if state.stop:
+        return True
+    if ev.kind is Kind.CHANGE:
+        deadlines.note_change(cfg.debounce)
+        return False
+    if ev.kind is Kind.DUE:
+        if not state.stop:
+            run_twoway(cfg, state)
+            if not state.stop:
+                deadlines.arm_interval(cfg.interval)
+        return state.stop
+    if ev.kind is Kind.WATCH_LOST and state.watch:
+        state.watch = False
+        log(cfg, f"inotifywait failed; falling back to polling every {cfg.interval}s")
+    return False
+
+
+def drain_ready(
+    cfg: Config,
+    state: State,
+    events: queue.Queue[Event],
+    deadlines: Deadlines,
+) -> bool:
+    while True:
+        try:
+            ev = events.get_nowait()
+        except queue.Empty:
+            return state.stop
+        if apply_event(cfg, state, deadlines, ev):
+            return True
+
+
+def handle_conn(
+    cfg: Config,
+    state: State,
+    events: queue.Queue[Event],
+    conn: socket.socket,
+) -> None:
+    reader = socket_reader(conn)
+    try:
+        line = reader.readline()
+        item = parse_request(line) if line.strip() else None
+        if item is None:
+            if line.strip():
+                log(cfg, "dropping unreadable queue item")
+                try:
+                    conn.sendall(b'{"rc":2}\n')
+                except OSError:
+                    pass
+            return
+        item.done = threading.Event()
+        if not enqueue_item(state, events, item):
+            item.rc = 1
+            item.done.set()
+        item.done.wait()
+        write_reply(conn, item)
+    except OSError:
+        pass
+    finally:
+        try:
+            reader.close()
+        except OSError:
+            pass
+
+
+def accept_loop(
+    cfg: Config,
+    state: State,
+    events: queue.Queue[Event],
+    listener: socket.socket,
+) -> None:
+    listener.settimeout(0.5)
+    while not state.stop:
+        try:
+            conn, _addr = listener.accept()
+        except TimeoutError:
+            continue
+        except OSError:
+            return
+        conn.settimeout(None)
+        threading.Thread(
+            target=handle_conn,
+            args=(cfg, state, events, conn),
+            daemon=True,
+        ).start()
+
+
+def inotify_command(cfg: Config) -> list[str]:
+    return [
+        "inotifywait",
+        "-r",
+        "-t",
+        "60",
+        "-e",
+        "modify,create,delete,move,attrib",
+        "--exclude",
+        INOTIFY_EXCLUDE,
+        cfg.workspace_dir,
+    ]
+
+
+def inotify_loop(cfg: Config, state: State, events: queue.Queue[Event]) -> None:
+    while not state.stop:
+        try:
+            proc = subprocess.Popen(
+                inotify_command(cfg),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            events.put(Event(Kind.WATCH_LOST))
+            return
+        state.wait_proc = proc
+        proc.wait()
+        state.wait_proc = None
+        if state.stop:
+            return
+        code = proc.returncode
+        if code == 0:
+            events.put(Event(Kind.CHANGE))
+            continue
+        if code == 2:
+            continue
+        events.put(Event(Kind.WATCH_LOST))
+        return
+
+
+def watch_stop(read_fd: int, events: queue.Queue[Event]) -> None:
+    try:
+        os.read(read_fd, 1)
+    except OSError:
+        return
+    events.put(Event(Kind.STOP))
+
+
+def stop_inotify(state: State) -> None:
+    proc = state.wait_proc
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+
+
+def log_starting(cfg: Config, state: State) -> None:
+    if state.watch:
+        log(
+            cfg,
+            "starting: "
+            f"remote={cfg.remote} watching={cfg.workspace_dir} "
+            f"debounce={cfg.debounce}s max-interval={cfg.interval}s",
+        )
+        return
+    log(
+        cfg,
+        "starting: "
+        f"remote={cfg.remote} interval={cfg.interval}s "
+        f"workspace={cfg.workspace_dir} (inotifywait not found)",
+    )
+
+
+def shutdown(
+    cfg: Config,
+    state: State,
+    events: queue.Queue[Event],
+    deadlines: Deadlines,
+) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    state.stop = True
+    deadlines.stop()
+    stop_inotify(state)
+    log(cfg, "stop requested; running final sync")
+    with state.admit:
+        state.accepting = False
+        pending: list[Event] = []
+        while True:
+            try:
+                pending.append(events.get_nowait())
+            except queue.Empty:
+                break
+    for ev in pending:
+        item = ev.item
+        if ev.kind is Kind.EXPLICIT and item is not None and item.explicit:
+            run_item(cfg, state, item)
+            continue
+        if item is not None and item.done is not None and not item.done.is_set():
+            item.rc = 1
+            item.done.set()
+    run_twoway(cfg, state)
+    log(cfg, "exiting")
+
+
+def deliver_initial(state: State, events: queue.Queue[Event], item: Item) -> None:
+    item.done = threading.Event()
+    threading.Thread(target=reply_when_done, args=(item,), daemon=True).start()
+    if enqueue_item(state, events, item):
+        conn = item.conn
+        if conn is not None:
+            try:
+                conn.sendall(b"+\n")
+            except OSError:
+                pass
+        return
+    item.rc = 1
+    if item.done is not None:
+        item.done.set()
+
+
+def run_worker(
+    cfg: Config,
+    listener: socket.socket,
+    force_resync: bool,
+    initial: Item | None,
+) -> None:
+    global CURRENT
+    state = State(force_resync=force_resync)
+    events: queue.Queue[Event] = queue.Queue()
+    deadlines = Deadlines(events)
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(read_fd, False)
+    os.set_inheritable(write_fd, False)
+    os.set_blocking(write_fd, False)
+    CURRENT = state
+    try:
+        signal.set_wakeup_fd(write_fd)
+        signal.signal(signal.SIGTERM, handle_stop)
+        signal.signal(signal.SIGINT, handle_stop)
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        threading.Thread(
+            target=watch_stop,
+            args=(read_fd, events),
+            daemon=True,
+        ).start()
+        write_filters(cfg)
+        git_init(cfg)
+        log_starting(cfg, state)
+        if initial is not None:
+            deliver_initial(state, events, initial)
+        if drain_ready(cfg, state, events, deadlines):
+            shutdown(cfg, state, events, deadlines)
+            return
+        threading.Thread(
+            target=accept_loop,
+            args=(cfg, state, events, listener),
+            daemon=True,
+        ).start()
+        if state.watch:
+            threading.Thread(
+                target=inotify_loop,
+                args=(cfg, state, events),
+                daemon=True,
+            ).start()
+        deadlines.arm_interval(cfg.interval, due_now=True)
+        while not state.stop:
+            rotate_log(cfg)
+            if apply_event(cfg, state, deadlines, events.get()):
+                break
+        shutdown(cfg, state, events, deadlines)
+    finally:
+        deadlines.stop()
+        state.stop = True
+        signal.set_wakeup_fd(-1)
+        close_fd(write_fd)
+        stop_inotify(state)
+        CURRENT = None
+        close_fd(read_fd)
+
+
+def handle_stop(_signum: int, _frame: FrameType | None) -> None:
+    # set_wakeup_fd writes the pipe. watch_stop turns that into a queue event.
+    state = CURRENT
+    if state is None:
+        return
+    state.stop = True
+
+
+def read_initial_item(fd: int) -> Item | None:
+    try:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=fd)
+    except OSError:
+        close_fd(fd)
+        return None
+    conn.set_inheritable(False)
+    reader = socket_reader(conn)
+    line = reader.readline()
+    item = parse_request(line) if line.strip() else None
+    if item is None:
+        try:
+            reader.close()
+        except OSError:
+            pass
+        return None
+    item.conn = conn
+    item.reader = reader
+    return item
+
+
+def note_running(cfg: Config, force_resync: bool) -> None:
+    if not force_resync:
+        log(cfg, "r2-sync already running; exiting")
+        return
+    try:
+        with open(cfg.resync_request, "a", encoding="utf-8"):
+            pass
+    except OSError:
+        pass
+    log(cfg, "resync requested; running r2-sync will do it")
+
+
+def start_worker(cfg: Config, force_resync: bool, initial_fd: int | None) -> int:
+    listener = bind_listener()
+    if listener is None:
+        if initial_fd is not None:
+            close_fd(initial_fd)
+            return 0 if socket_is_live() is True else 1
+        if socket_is_live() is True:
+            note_running(cfg, force_resync)
+            return 0
+        log(cfg, f"could not bind {SOCKET_PATH}")
+        return 1
+    initial = read_initial_item(initial_fd) if initial_fd is not None else None
+    try:
+        run_worker(cfg, listener, force_resync, initial)
+    finally:
+        release_listener(listener)
+    return 0
+
+
+def script_path() -> str:
+    raw = sys.argv[0]
+    if os.path.sep not in raw:
+        found = shutil.which(raw)
+        if found:
+            raw = found
+    return os.path.realpath(raw)
+
+
+def transact(conn: socket.socket, op: str) -> int:
+    payload = json.dumps(
+        {"id": uuid.uuid4().hex, "op": op, "explicit": True}
+    ) + "\n"
+    reader = socket_reader(conn)
+    try:
+        conn.sendall(payload.encode())
+        return parse_rc(reader.readline())
+    finally:
+        reader.close()
+
+
+def connect_submit(op: str) -> int | None:
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        try:
+            conn.connect(SOCKET_PATH)
+        except (ConnectionRefusedError, FileNotFoundError):
+            return None
+        except OSError:
             return 1
-            ;;
-        esac
-        ;;
-    esac
-    log "removing stale bisync lock $(basename "$lock")"
-    rm -f "$lock"
-  done
-  return 0
-}
+        try:
+            return transact(conn, op)
+        except OSError:
+            return 1
+    finally:
+        conn.close()
 
-# One watchdog per volume. A second `r2-sync --resync` asks the running
-# process to merge on its next cycle instead of starting another bisync.
-claim_singleton() {
-  local old args
-  if [ -f "$PIDFILE" ]; then
-    old=$(tr -cd '0-9' < "$PIDFILE")
-    args=""
-    if [ -n "$old" ] && [ "$old" != "$$" ]; then
-      args=$(ps -p "$old" -o args= 2>/dev/null || true)
-    fi
-    case "$args" in
-      *bin/r2-sync*|r2-sync|r2-sync\ *)
-        if [ "$FORCE_RESYNC" -eq 1 ]; then
-          touch "$RESYNC_REQUEST"
-          log "resync requested; running r2-sync (pid $old) will do it"
-        else
-          log "r2-sync already running (pid $old); exiting"
-        fi
-        exit 0
-        ;;
-    esac
-  fi
-  echo $$ > "$PIDFILE"
-  trap 'rm -f "$PIDFILE"' EXIT
-}
 
-have_listings() {
-  ls "$WORKDIR"/*.lst >/dev/null 2>&1
-}
+def spawn_submit(op: str) -> int | None:
+    parent, child = socket.socketpair()
+    env = os.environ.copy()
+    env[INITIAL_FD_ENV] = str(child.fileno())
+    try:
+        subprocess.Popen(
+            [sys.executable, script_path()],
+            env=env,
+            pass_fds=(child.fileno(),),
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError:
+        parent.close()
+        child.close()
+        return 1
+    child.close()
+    reader = socket_reader(parent)
+    try:
+        payload = json.dumps(
+            {"id": uuid.uuid4().hex, "op": op, "explicit": True}
+        ) + "\n"
+        parent.sendall(payload.encode())
+        if reader.readline().strip() != "+":
+            return None
+        return parse_rc(reader.readline())
+    except OSError:
+        return 1
+    finally:
+        reader.close()
 
-run_bisync() {
-  local mode="${1:-normal}" out rc
-  if ! release_stale_lock; then
-    return 2
-  fi
-  if [ "$mode" = "resync" ]; then
-    log "running resync (merging local and R2, newest wins)"
-    out=$(rclone bisync "$WORKSPACE_DIR" "$REMOTE" "${BISYNC_COMMON[@]}" --resync --resync-mode newer 2>&1)
-    rc=$?
-  else
-    out=$(rclone bisync "$WORKSPACE_DIR" "$REMOTE" "${BISYNC_COMMON[@]}" 2>&1)
-    rc=$?
-  fi
-  if [ $rc -ne 0 ]; then
-    log "bisync exited $rc: $(echo "$out" | tail -n 8 | tr '\n' ' ')"
-  fi
-  return $rc
-}
 
-sync_cycle() {
-  if [ -e "$PAUSE_FLAG" ]; then
-    log "paused ($PAUSE_FLAG exists); skipping"
-    return 0
-  fi
-  if [ -e "$RESYNC_REQUEST" ]; then
-    rm -f "$RESYNC_REQUEST"
-    FORCE_RESYNC=1
-    log "resync requested"
-  fi
+def foreground(cfg: Config, op: str) -> int:
+    rc = connect_submit(op)
+    if rc is not None:
+        return rc
+    rc = spawn_submit(op)
+    if rc is not None:
+        return rc
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline:
+        rc = connect_submit(op)
+        if rc is not None:
+            return rc
+        time.sleep(0.05)
+    log(cfg, f"{op} failed: worker did not answer")
+    return 1
 
-  git_snapshot "pre-sync"
 
-  local rc=0
-  if [ "$FORCE_RESYNC" -eq 1 ] || ! have_listings; then
-    run_bisync resync || rc=$?
-    # Keep the request if another bisync still holds the lock.
-    if [ "$rc" -ne 2 ]; then
-      FORCE_RESYNC=0
-    fi
-  else
-    run_bisync normal || rc=$?
-    # 7 = critical error requiring --resync (lost state, filter change, ...)
-    if [ $rc -eq 7 ]; then
-      run_bisync resync || rc=$?
-    fi
-  fi
-  # 2 = another bisync still holds the lock; try again next cycle.
-  if [ $rc -eq 2 ]; then
-    return 0
-  fi
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="r2-sync",
+        description=DESCRIPTION,
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
+    commands = parser.add_subparsers(dest="command", metavar="command")
+    commands.add_parser(
+        "push",
+        help="Make R2 match the workspace, including deletes.",
+        description=(
+            "Make R2 match the workspace, including deletes. Skips the "
+            "25% delete cap and refreshes bisync listings so the next "
+            "unattended cycle keeps this tree. Runs even when the pause "
+            "file exists. Exits with the operation's status."
+        ),
+    )
+    commands.add_parser(
+        "pull",
+        help="Make the workspace match R2, including deletes.",
+        description=(
+            "Make the workspace match R2, including deletes. Skips the "
+            "25% delete cap and refreshes bisync listings so the next "
+            "unattended cycle keeps this tree. Runs even when the pause "
+            "file exists. Exits with the operation's status."
+        ),
+    )
+    commands.add_parser(
+        "resync",
+        help="Merge both sides; newest file wins.",
+        description=(
+            "Merge the workspace and R2; the newest file wins. Keeps the "
+            "25% delete cap. Runs even when the pause file exists. Exits "
+            "with the operation's status."
+        ),
+    )
+    return parser
 
-  git_snapshot "post-sync"
-}
 
-# --- watchdog ---------------------------------------------------------------
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
-STOP=0
-WAIT_PID=""
-WATCH=1
-command -v inotifywait >/dev/null 2>&1 || WATCH=0
 
-on_stop() {
-  STOP=1
-  [ -n "$WAIT_PID" ] && kill "$WAIT_PID" 2>/dev/null
-}
-trap on_stop TERM INT
+def take_initial_fd() -> int | None:
+    raw = os.environ.pop(INITIAL_FD_ENV, "")
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
-# Run a command in the background and wait for it, so a TERM during the wait
-# interrupts us immediately instead of after the full delay.
-wait_for() {
-  "$@" &
-  WAIT_PID=$!
-  wait "$WAIT_PID" 2>/dev/null
-  local rc=$?
-  WAIT_PID=""
-  return $rc
-}
 
-watch_workspace() {
-  inotifywait -r -qq -t "$INTERVAL" \
-    -e modify,create,delete,move,attrib \
-    --exclude '(^|/)(\.git|node_modules|__pycache__|\.obsidian|\.trash)/' \
-    "$WORKSPACE_DIR"
-}
+def main(argv: list[str] | None = None) -> int:
+    initial_fd = take_initial_fd()
+    args = parse_args(argv)
+    env = read_env()
+    if env.bucket == "":
+        close_fd(initial_fd)
+        return 0
+    cfg = build_config(env)
+    if cfg is None:
+        close_fd(initial_fd)
+        return 0
+    if args.command:
+        close_fd(initial_fd)
+        return foreground(cfg, args.command)
+    return start_worker(cfg, force_resync=False, initial_fd=initial_fd)
 
-# Block until it's time to sync again: as soon as the workspace changes, or
-# after INTERVAL so changes made on the R2 side still get pulled in.
-wait_for_next_sync() {
-  if [ "$WATCH" -eq 0 ]; then
-    wait_for sleep "$INTERVAL"
-    return 0
-  fi
 
-  wait_for watch_workspace
-  # 0 = change seen, 1 = inotify unusable, 2 = timed out, >128 = signalled.
-  case $? in
-    0)
-      [ "$STOP" -eq 1 ] && return 0
-      wait_for sleep "$DEBOUNCE"
-      ;;
-    1)
-      WATCH=0
-      log "inotifywait failed; falling back to polling every ${INTERVAL}s"
-      wait_for sleep "$INTERVAL"
-      ;;
-  esac
-}
-
-claim_singleton
-git_init
-if [ "$WATCH" -eq 1 ]; then
-  log "starting: remote=$REMOTE watching=$WORKSPACE_DIR debounce=${DEBOUNCE}s max-interval=${INTERVAL}s"
-else
-  log "starting: remote=$REMOTE interval=${INTERVAL}s workspace=$WORKSPACE_DIR (inotifywait not found)"
-fi
-
-while [ "$STOP" -eq 0 ]; do
-  rotate_log
-  sync_cycle
-  [ "$STOP" -eq 1 ] && break
-  wait_for_next_sync
-done
-
-log "stop requested; running final sync"
-# Ignore further signals so the final sync can finish.
-trap '' TERM INT
-sync_cycle
-log "exiting"
+if __name__ == "__main__":
+    sys.exit(main())

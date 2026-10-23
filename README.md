@@ -89,6 +89,16 @@ The job watches the workspace with inotify, so a sync starts a few seconds after
 
 On first run the local workspace and the bucket are merged (newest file wins). After that, deletes and edits propagate both ways. If the same file changes on both sides within one cycle, the newer one wins and the older is kept as a numbered copy (e.g. `MEMORY.md.conflict1`). On redeploy, the job runs one last sync before the container stops. Logs: stdout and `/data/.openclaw/r2-sync.log`.
 
+The background job always merges. These commands run one operation and exit. If the job is already running they wait for it instead of starting a second rclone; otherwise they start it. They run even when the pause file exists. A pause still skips the unattended cycles.
+
+```bash
+r2-sync push      # R2 is replaced by the workspace, including deletes
+r2-sync pull      # the workspace is replaced by R2, including deletes
+r2-sync resync    # merge both sides; newest file wins
+```
+
+`push` and `pull` skip the safety cap that refuses a cycle deleting more than 25% of files. `resync` and the unattended job keep that cap. After `push` or `pull`, the next unattended cycle keeps that result. `resync` is also what to run after a filters change.
+
 ### 3. Obsidian
 
 Install the **Remotely Save** community plugin and set:
@@ -112,15 +122,16 @@ git -C /data/workspace checkout <sha> -- MEMORY.md     # restore one file
 git -C /data/workspace checkout <sha> -- .             # restore everything
 ```
 
-A restore gives files a fresh modified time, so the next sync pushes them to R2 and Obsidian. For a large restore, pause the sync first and resume afterwards:
+A restore gives files a fresh modified time, so the next unattended sync sends them to R2 and Obsidian. To make R2 match a restored workspace even where the bucket is newer, and to delete bucket files that are gone locally, run `r2-sync push`. To discard local edits and take the bucket as-is, run `r2-sync pull`. To merge again instead, newest file wins, run `r2-sync resync`.
+
+Pause the unattended job around a large restore when you want to inspect the workspace before the next cycle:
 
 ```bash
-touch /data/.r2-sync-paused    # pause
+touch /data/.r2-sync-paused    # pause unattended cycles
 rm /data/.r2-sync-paused       # resume
-r2-sync --resync               # merge both sides again (newest wins)
 ```
 
-If a sync is killed mid-run, the next start drops the leftover bisync lock when that rclone process is gone. `--resync` is also what to run after a filters change. When a sync is already running, the command just asks that process to resync; it does not start a second one.
+If a sync is killed mid-run, the next start drops the leftover bisync lock when that rclone process is gone.
 
 Set `R2_GIT_REMOTE` to also push snapshots to a private repo, so history survives losing the volume. Changes are captured per sync cycle, not per edit.
 
