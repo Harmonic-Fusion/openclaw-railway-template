@@ -55,12 +55,13 @@ _openclaw_console_dir=${OPENCLAW_STATE_DIR:-/data/.openclaw}
   fi
   # -u so the nested zsh does not inherit the guard. This root shell keeps
   # it, so a later bashrc source does not enter zsh a second time.
+  # -i forces an interactive zsh, which reads ~/.zshrc and defines `cdw`.
   exec "$_openclaw_gosu" openclaw env -u OPENCLAW_CONSOLE_ENTERED \
     HOME=/home/openclaw \
     USER=openclaw \
     LOGNAME=openclaw \
     SHELL="$_openclaw_zsh" \
-    "$_openclaw_zsh"
+    "$_openclaw_zsh" -i
 ) || true
 
 unset _openclaw_gosu _openclaw_zsh _openclaw_console_dir
