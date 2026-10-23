@@ -38,7 +38,7 @@
     {
       "name": "ops_provider_quota",
       "label": "Provider Quota",
-      "description": "Remaining quota, balance, or budget for every configured model provider, plus top-up links. Read-only.",
+      "description": "Remaining quota, balance, or budget for every configured model provider, plus top-up links. Calls the DeepInfra, Groq and Perplexity APIs directly, since OpenClaw reports no usage for them. Read-only.",
       "command": "provider-quota",
       "args": ["--json"],
       "result": { "format": "json", "key": "report" },
@@ -47,6 +47,16 @@
           "type": "string",
           "flag": "--agent",
           "description": "Report for a specific agent id instead of the default."
+        },
+        "groqProbe": {
+          "type": "boolean",
+          "flag": "--groq-probe",
+          "description": "Read Groq request/token limits by sending a one-token completion. Off by default because it is billable."
+        },
+        "noProbe": {
+          "type": "boolean",
+          "flag": "--no-probe",
+          "description": "Skip the direct provider API calls and report only what OpenClaw knows."
         }
       }
     },

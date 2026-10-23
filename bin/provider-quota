@@ -5,27 +5,49 @@ Reads live usage from `openclaw status --usage` and the model providers named
 in openclaw.json. Prints each remaining window, balance, or budget, then a
 link to add tokens. Providers that do not report a quota still get a link.
 
+OpenClaw only reports usage for providers whose plugin declares a usage hook
+(anthropic, openai, openrouter, xai, minimax, github-copilot, clawrouter).
+DeepInfra, Groq and Perplexity have no hook, so this script calls their APIs
+directly with the keys in the environment. See PROBES.
+
   provider-quota
   provider-quota --json
   provider-quota --agent work
+  provider-quota --groq-probe      spend one token to read Groq rate limits
+  provider-quota --no-probe        skip the direct provider API calls
 
 Env:
   OPENCLAW_STATE_DIR     config directory (default /data/.openclaw)
   OPENCLAW_ENTRY         path to OpenClaw entry.js, when the CLI is not on PATH
   OPENCLAW_NODE          node binary used with OPENCLAW_ENTRY (default node)
+  DEEPINFRA_API_KEY      balance, month spend, spend limit, scoped credits
+  GROQ_API_KEY           request/token rate limits
+  GROQ_QUOTA_MODEL       model the --groq-probe request names (default gpt-oss-20b)
+  PERPLEXITY_API_KEY     makes Perplexity show up; carries no quota itself
+  PERPLEXITY_ANALYTICS_API_KEY
+                         org analytics key (Enterprise + Computer), for credits
+                         consumed. Perplexity exposes no API credit balance.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+from typing import Callable
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_PROBE_TIMEOUT_SECONDS = 10
+MAX_PROBE_RESPONSE_BYTES = 1 << 20
 
 # Canonical provider id -> (display name, [(link label, url), ...]).
 # Local runtimes have a name and no top-up page.
@@ -51,6 +73,10 @@ PROVIDERS: dict[str, tuple[str, list[tuple[str, str]]]] = {
     "deepseek": (
         "DeepSeek",
         [("Add credits", "https://platform.deepseek.com/top_up")],
+    ),
+    "deepinfra": (
+        "DeepInfra",
+        [("Add credits", "https://deepinfra.com/dash/billing")],
     ),
     "openrouter": (
         "OpenRouter",
@@ -208,6 +234,8 @@ HOSTS = {
     "api.x.ai": "xai",
     "api.deepseek.com": "deepseek",
     "api.groq.com": "groq",
+    "api.deepinfra.com": "deepinfra",
+    "api.perplexity.ai": "perplexity",
     "api.mistral.ai": "mistral",
     "api.together.ai": "together",
     "api.together.xyz": "together",
@@ -222,6 +250,386 @@ HOSTS = {
 }
 
 LOCAL = {"ollama", "vllm", "sglang", "litellm"}
+
+# Providers OpenClaw reports no usage for. Each probe reads its own key from
+# the environment and returns the same row shapes a usage snapshot would, so
+# the report renders them beside the providers the CLI does cover.
+#   discovery: any of these keys makes the provider appear in the report
+#   credential: the key the probe authenticates with
+#   needsKey: skip the request and name the variable when the key is missing.
+#     Perplexity probes without one so it can explain the console-only balance.
+PROBES: dict[str, dict] = {
+    "deepinfra": {
+        "discovery": ["DEEPINFRA_API_KEY"],
+        "credential": ["DEEPINFRA_API_KEY"],
+        "needsKey": True,
+    },
+    "groq": {
+        "discovery": ["GROQ_API_KEY"],
+        "credential": ["GROQ_API_KEY"],
+        "needsKey": True,
+    },
+    "perplexity": {
+        "discovery": ["PERPLEXITY_API_KEY", "PERPLEXITY_ANALYTICS_API_KEY"],
+        "credential": ["PERPLEXITY_ANALYTICS_API_KEY"],
+        "needsKey": False,
+    },
+}
+
+DEEPINFRA_ME_URL = "https://api.deepinfra.com/v1/me"
+DEEPINFRA_USAGE_URL = "https://api.deepinfra.com/payment/usage?from=current"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+DEFAULT_GROQ_QUOTA_MODEL = "openai/gpt-oss-20b"
+PERPLEXITY_ANALYTICS_URL = "https://api.perplexity.ai/v1/analytics/computer/usage"
+PERPLEXITY_ANALYTICS_DAYS = 7
+
+# x-ratelimit-reset-* arrives as a Go duration such as "2m59.56s" or "7.66s".
+DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
+DURATION_SCALE = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def env_value(names: list[str]) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def number(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and abs(parsed) != float("inf") else None
+
+
+def cents(value: object) -> float | None:
+    """DeepInfra keeps every money field in cents, Stripe style."""
+    amount = number(value)
+    return None if amount is None else amount / 100
+
+
+def money(amount: float) -> str:
+    return f"${amount:,.2f}"
+
+
+def count(amount: float) -> str:
+    return f"{amount:,.0f}"
+
+
+def parse_duration(value: object) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    total = 0.0
+    matched = False
+    for amount, unit in DURATION_PART.findall(text):
+        total += float(amount) * DURATION_SCALE[unit]
+        matched = True
+    if matched:
+        return total
+    plain = number(text)
+    return plain if plain is not None and plain >= 0 else None
+
+
+def fetch_json(
+    url: str,
+    token: str,
+    timeout: float,
+    *,
+    method: str = "GET",
+    body: dict | None = None,
+) -> dict:
+    """One JSON request. Never raises; failures come back in ["error"]."""
+    headers = {"Accept": "application/json", "User-Agent": "provider-quota"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return read_response(response.status, response.headers, response.read(MAX_PROBE_RESPONSE_BYTES + 1))
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read(MAX_PROBE_RESPONSE_BYTES + 1)
+        except OSError:
+            raw = b""
+        result = read_response(exc.code, exc.headers, raw)
+        result["error"] = result["error"] or http_error(exc.code, result["payload"])
+        return result
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        reason = getattr(exc, "reason", exc)
+        return {"status": 0, "headers": {}, "payload": None, "error": f"unreachable ({reason})"}
+
+
+def read_response(status: int, raw_headers: object, raw: bytes) -> dict:
+    headers = {}
+    for key, value in getattr(raw_headers, "items", lambda: [])():
+        headers[str(key).lower()] = value
+    result = {"status": int(status), "headers": headers, "payload": None, "error": ""}
+    if len(raw) > MAX_PROBE_RESPONSE_BYTES:
+        result["error"] = "response too large"
+        return result
+    if not raw.strip():
+        return result
+    try:
+        result["payload"] = json.loads(raw.decode("utf-8", "replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        result["error"] = "malformed response"
+    return result
+
+
+def http_error(status: int, payload: object) -> str:
+    detail = ""
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            detail = str(error.get("message") or error.get("type") or "")
+        elif isinstance(error, str):
+            detail = error
+        if not detail:
+            raw_detail = payload.get("detail") or payload.get("message")
+            if isinstance(raw_detail, str):
+                detail = raw_detail
+    detail = detail.strip()
+    if status in {401, 403}:
+        return detail or f"key rejected ({status})"
+    if status == 404:
+        return detail or "not available for this account (404)"
+    return f"{detail} ({status})" if detail else f"HTTP {status}"
+
+
+def ratelimit_windows(headers: dict, now: datetime, group: str = "") -> list[dict]:
+    """Turn x-ratelimit-* headers into remaining-quota rows."""
+    rows = []
+    for kind, label, unit in (
+        ("requests", "Requests (RPD)", "requests"),
+        ("tokens", "Tokens (TPM)", "tokens"),
+    ):
+        limit = number(headers.get(f"x-ratelimit-limit-{kind}"))
+        remaining = number(headers.get(f"x-ratelimit-remaining-{kind}"))
+        if limit is None or remaining is None or limit <= 0:
+            continue
+        remaining = max(0.0, min(limit, remaining))
+        reset_seconds = parse_duration(headers.get(f"x-ratelimit-reset-{kind}"))
+        when = now + timedelta(seconds=reset_seconds) if reset_seconds is not None else None
+        rows.append(
+            {
+                "label": f"{group} {label}".strip(),
+                "remainingPercent": clamp_percent(remaining / limit * 100) or 0.0,
+                "usedPercent": clamp_percent((limit - remaining) / limit * 100),
+                "remainingText": f"{count(remaining)} of {count(limit)} {unit} left",
+                "resets": format_reset(when, now),
+                "resetsAt": when.isoformat() if when else None,
+            }
+        )
+    return rows
+
+
+def probe_deepinfra(token: str, timeout: float, options: dict) -> dict:
+    me = fetch_json(DEEPINFRA_ME_URL, token, timeout)
+    if me["error"]:
+        return {"error": me["error"]}
+    payload = me["payload"] if isinstance(me["payload"], dict) else {}
+    checklist = payload.get("checklist")
+    if not isinstance(checklist, dict):
+        return {"error": "no billing data in /v1/me"}
+
+    now = datetime.now(timezone.utc)
+    windows: list[dict] = []
+    billing: list[dict] = []
+
+    # A negative Stripe balance is money already paid in; positive is owed.
+    balance = cents(checklist.get("stripe_balance"))
+    if balance is not None:
+        available = -balance
+        if available >= 0:
+            billing.append({"label": "Prepaid balance", "text": f"{money(available)} left"})
+        else:
+            billing.append({"label": "Balance due", "text": f"{money(-available)} owed"})
+
+    recent = cents(checklist.get("recent"))
+    if recent is not None:
+        billing.append({"label": "Since last invoice", "text": f"{money(recent)} spent"})
+
+    limit = cents(checklist.get("limit"))
+    if limit is not None and limit > 0:
+        used = recent if recent is not None else 0.0
+        windows.append(
+            {
+                "label": "Spending limit",
+                "remainingPercent": clamp_percent((limit - used) / limit * 100) or 0.0,
+                "usedPercent": clamp_percent(used / limit * 100),
+                "remainingText": f"{money(max(0.0, limit - used))} of {money(limit)} left",
+                "resets": None,
+                "resetsAt": None,
+            }
+        )
+
+    for credit in checklist.get("scoped_credits") or []:
+        if not isinstance(credit, dict) or credit.get("expired") is True:
+            continue
+        granted = cents(credit.get("granted_cents"))
+        left = cents(credit.get("remaining_cents"))
+        if granted is None or left is None or granted <= 0:
+            continue
+        name = str(credit.get("name") or "credit").strip() or "credit"
+        expires = parse_reset(credit.get("expires_ts"))
+        windows.append(
+            {
+                "label": f"{name} credit",
+                "remainingPercent": clamp_percent(left / granted * 100) or 0.0,
+                "usedPercent": clamp_percent((granted - left) / granted * 100),
+                "remainingText": f"{money(left)} of {money(granted)} left",
+                "resets": format_reset(expires, now),
+                "resetVerb": "expires",
+                "resetsAt": expires.isoformat() if expires else None,
+            }
+        )
+
+    month = fetch_json(DEEPINFRA_USAGE_URL, token, timeout)
+    if not month["error"] and isinstance(month["payload"], dict):
+        months = month["payload"].get("months")
+        if isinstance(months, list) and months:
+            latest = months[-1] if isinstance(months[-1], dict) else {}
+            spent = cents(latest.get("total_cost"))
+            if spent is not None:
+                period = str(latest.get("period") or "").strip()
+                label = f"Spend ({period})" if period else "Spend this month"
+                billing.append({"label": label, "text": f"{money(spent)} spent"})
+
+    result = {"windows": windows, "billing": billing}
+    if checklist.get("suspended") is True:
+        reason = str(checklist.get("suspend_reason") or "").strip()
+        result["error"] = f"account suspended ({reason})" if reason else "account suspended"
+    return result
+
+
+def probe_groq(token: str, timeout: float, options: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    # /models is free. Groq documents the headers on API responses generally,
+    # so read them here before considering a billable request.
+    listing = fetch_json(GROQ_MODELS_URL, token, timeout)
+    if listing["status"] in {401, 403}:
+        return {"error": listing["error"]}
+    windows = ratelimit_windows(listing["headers"], now)
+    if windows:
+        return {"windows": windows}
+    if not options.get("groq_probe"):
+        return {"note": "rate limits need an inference request; rerun with --groq-probe"}
+
+    model = os.environ.get("GROQ_QUOTA_MODEL", "").strip() or DEFAULT_GROQ_QUOTA_MODEL
+    chat = fetch_json(
+        GROQ_CHAT_URL,
+        token,
+        timeout,
+        method="POST",
+        body={
+            "model": model,
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1,
+            "temperature": 0,
+        },
+    )
+    windows = ratelimit_windows(chat["headers"], now)
+    if windows:
+        # Groq scopes RPD and TPM per model, so name the one that was asked.
+        return {"windows": windows, "plan": model}
+    retry_after = parse_duration(chat["headers"].get("retry-after"))
+    if chat["status"] == 429:
+        when = now + timedelta(seconds=retry_after) if retry_after is not None else None
+        resets = format_reset(when, now) if when else "soon"
+        return {"error": f"rate limited, clears {resets}"}
+    return {"error": chat["error"] or "no rate-limit headers returned"}
+
+
+def probe_perplexity(token: str, timeout: float, options: dict) -> dict:
+    # The API credit balance is console-only. The analytics API is a different
+    # (Enterprise, org-scoped) key and reports Computer credits consumed.
+    if not token:
+        return {"note": "balance is console-only; see PERPLEXITY_ANALYTICS_API_KEY"}
+    now = datetime.now(timezone.utc)
+    start = int((now - timedelta(days=PERPLEXITY_ANALYTICS_DAYS)).timestamp())
+    query = urllib.parse.urlencode(
+        {
+            "dataset": "credit_usage",
+            "start_time": start,
+            "bucket_width": "1d",
+            "limit": PERPLEXITY_ANALYTICS_DAYS,
+        }
+    )
+    response = fetch_json(f"{PERPLEXITY_ANALYTICS_URL}?{query}", token, timeout)
+    if response["status"] == 404:
+        return {"error": "analytics API not enabled for this organization"}
+    if response["error"]:
+        return {"error": response["error"]}
+    payload = response["payload"] if isinstance(response["payload"], dict) else {}
+    buckets = payload.get("data")
+    if not isinstance(buckets, list):
+        return {"error": "malformed analytics response"}
+    total = 0.0
+    for bucket in buckets:
+        if isinstance(bucket, dict):
+            total += number(bucket.get("count")) or 0.0
+    # Consumption only: there is no limit to divide by, so this is not a window.
+    return {
+        "billing": [
+            {
+                "label": "Computer credits",
+                "text": f"{count(total)} used (last {PERPLEXITY_ANALYTICS_DAYS}d)",
+            }
+        ]
+    }
+
+
+PROBE_RUNNERS: dict[str, Callable[[str, float, dict], dict]] = {
+    "deepinfra": probe_deepinfra,
+    "groq": probe_groq,
+    "perplexity": probe_perplexity,
+}
+
+
+def probe_providers(config: dict) -> list[str]:
+    """Probe anything configured in openclaw.json or keyed in the environment."""
+    configured = set(configured_providers(config))
+    wanted = []
+    for provider_id, keys in PROBES.items():
+        if provider_id in configured or env_value(keys["discovery"]):
+            wanted.append(provider_id)
+    return wanted
+
+
+def run_probes(providers: list[str], timeout: float, options: dict) -> dict[str, dict]:
+    results: dict[str, dict] = {}
+    tasks = []
+    for provider_id in providers:
+        spec = PROBES[provider_id]
+        token = env_value(spec["credential"])
+        if not token and spec["needsKey"]:
+            results[provider_id] = {"note": f"set {spec['credential'][0]} to read quota"}
+            continue
+        tasks.append((provider_id, token))
+    if not tasks:
+        return results
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        futures = {
+            pool.submit(PROBE_RUNNERS[provider_id], token, timeout, options): provider_id
+            for provider_id, token in tasks
+        }
+        for future in concurrent.futures.as_completed(futures):
+            provider_id = futures[future]
+            try:
+                results[provider_id] = future.result()
+            except Exception as exc:  # a probe must never sink the report
+                results[provider_id] = {"error": f"probe failed ({exc})"}
+    return results
 
 
 def state_dir() -> Path:
@@ -398,6 +806,8 @@ def format_reset(when: datetime | None, now: datetime) -> str | None:
     diff = int((when - now).total_seconds())
     if diff <= 0:
         return "now"
+    if diff < 60:
+        return f"in {diff}s"
     minutes = diff // 60
     if minutes < 60:
         return f"in {minutes}m"
@@ -580,11 +990,20 @@ def load_usage(agent: str | None, timeout_seconds: float) -> tuple[list, int | N
     return usage_from_payload(payload)
 
 
-def build_report(config: dict, snapshots: list, usage_error: str | None) -> dict:
+def build_report(
+    config: dict,
+    snapshots: list,
+    usage_error: str | None,
+    probes: dict[str, dict] | None = None,
+) -> dict:
     live = snapshot_rows(snapshots)
+    probes = probes or {}
     ordered: list[str] = list(live)
     for provider_id in configured_providers(config):
         if provider_id not in live:
+            ordered.append(provider_id)
+    for provider_id in probes:
+        if provider_id not in ordered:
             ordered.append(provider_id)
     providers = []
     for provider_id in ordered:
@@ -592,24 +1011,36 @@ def build_report(config: dict, snapshots: list, usage_error: str | None) -> dict
         name, _links = provider_info(provider_id)
         base_url = provider_base_url(config, provider_id)
         key = canonical(provider_id)
+        probe = probes.get(key, {})
+        windows = [*(row.get("windows") or []), *(probe.get("windows") or [])]
+        billing = [*(row.get("billing") or []), *(probe.get("billing") or [])]
         note = ""
         error = row.get("error") or ""
-        if not row and key in LOCAL:
-            note = "runs locally"
-        elif not row and usage_error:
-            error = usage_error
-        elif not row:
-            note = "not reported"
+        if not windows and not billing:
+            # A probe speaks for its own provider, so its result wins over the
+            # generic "openclaw status --usage" failure.
+            if probe.get("error"):
+                error = probe["error"]
+            elif probe.get("note"):
+                note = probe["note"]
+            elif key in LOCAL:
+                note = "runs locally"
+            elif error:
+                pass
+            elif usage_error:
+                error = usage_error
+            else:
+                note = "not reported"
         providers.append(
             {
                 "id": provider_id,
                 "name": row.get("name") or name,
-                "plan": row.get("plan") or "",
+                "plan": row.get("plan") or probe.get("plan") or "",
                 "summary": row.get("summary") or "",
                 "error": error,
                 "note": note,
-                "windows": row.get("windows") or [],
-                "billing": row.get("billing") or [],
+                "windows": windows,
+                "billing": billing,
                 "addTokens": links_for(provider_id, base_url),
             }
         )
@@ -629,8 +1060,10 @@ def format_report(report: dict) -> str:
         lines: list[tuple[str, str]] = []
         for window in entry.get("windows") or []:
             detail = f"{format_percent(window['remainingPercent'])} left"
+            if window.get("remainingText"):
+                detail = f"{window['remainingText']}  {format_percent(window['remainingPercent'])}"
             if window.get("resets"):
-                detail = f"{detail}  resets {window['resets']}"
+                detail = f"{detail}  {window.get('resetVerb') or 'resets'} {window['resets']}"
             lines.append((str(window["label"]), detail))
         for item in entry.get("billing") or []:
             lines.append((item.get("label") or "balance", item["text"]))
@@ -651,35 +1084,52 @@ def format_report(report: dict) -> str:
     return "\n".join(blocks).rstrip() + "\n"
 
 
+USAGE = (
+    "usage: provider-quota [--json] [--agent ID] [--timeout SECONDS]\n"
+    "                      [--probe-timeout SECONDS] [--no-probe] [--groq-probe]"
+)
+
+
 def main(argv: list[str]) -> int:
     agent = None
     as_json = False
     timeout = float(DEFAULT_TIMEOUT_SECONDS)
+    probe_timeout = float(DEFAULT_PROBE_TIMEOUT_SECONDS)
+    probe = True
+    options = {"groq_probe": False}
     args = argv[1:]
     index = 0
     while index < len(args):
         arg = args[index]
         if arg == "--json":
             as_json = True
+        elif arg == "--no-probe":
+            probe = False
+        elif arg == "--groq-probe":
+            options["groq_probe"] = True
         elif arg == "--agent":
             if index + 1 >= len(args):
-                print("usage: provider-quota [--json] [--agent ID] [--timeout SECONDS]", file=sys.stderr)
+                print(USAGE, file=sys.stderr)
                 return 2
             index += 1
             agent = args[index]
-        elif arg == "--timeout":
+        elif arg in {"--timeout", "--probe-timeout"}:
             if index + 1 >= len(args):
-                print("usage: provider-quota [--json] [--agent ID] [--timeout SECONDS]", file=sys.stderr)
+                print(USAGE, file=sys.stderr)
                 return 2
             index += 1
             try:
-                timeout = float(args[index])
+                seconds = float(args[index])
             except ValueError:
-                print("--timeout must be a number of seconds", file=sys.stderr)
+                print(f"{arg} must be a number of seconds", file=sys.stderr)
                 return 2
-            if timeout <= 0:
-                print("--timeout must be greater than 0", file=sys.stderr)
+            if seconds <= 0:
+                print(f"{arg} must be greater than 0", file=sys.stderr)
                 return 2
+            if arg == "--timeout":
+                timeout = seconds
+            else:
+                probe_timeout = seconds
         elif arg in {"-h", "--help"}:
             print(__doc__.strip())
             return 0
@@ -699,7 +1149,8 @@ def main(argv: list[str]) -> int:
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         usage_error = str(exc)
 
-    report = build_report(config, snapshots, usage_error)
+    probes = run_probes(probe_providers(config), probe_timeout, options) if probe else {}
+    report = build_report(config, snapshots, usage_error, probes)
     if not report["providers"]:
         message = usage_error or "No model providers are configured, and no usage was reported."
         print(message, file=sys.stderr)

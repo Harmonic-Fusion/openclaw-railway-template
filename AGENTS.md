@@ -31,7 +31,7 @@ open http://localhost:8080/setup  # password: test
 **Key files**:
 - `src/server.js` — wrapper, proxy, gateway lifecycle, config persistence (no inline HTML/CSS)
 - `src/public/` — `setup.html`, `styles.css`, `setup-app.js` (vanilla JS, no build step)
-- `bin/` — console helpers copied to `/app/bin`, on `PATH` (also re-added in `/etc/profile.d/openclaw.sh`). `r2-sync` (inotify R2 workspace sync), `provider-quota` (quota/top-up links). `cdw` is a profile alias (scripts can't change caller's cwd)
+- `bin/` — console helpers copied to `/app/bin`, on `PATH` (also re-added in `/etc/profile.d/openclaw.sh`).
 - `plugins/ops-tools/` — tool plugin exposing `bin/` scripts as typed agent tools; declarations in `tools.json`, generic runner in `src/index.ts`, built into the image at `/app/plugins/ops-tools`
 - `Dockerfile` — single-stage: installs OpenClaw via npm + wrapper deps
 

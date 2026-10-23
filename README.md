@@ -62,17 +62,6 @@ docker run --rm -p 8080:8080 \
 # Setup wizard: http://localhost:8080/setup (password: test)
 ```
 
-## Console helpers
-
-A new Railway console starts as root `bash`, which immediately enters the `openclaw` user with `zsh` in `OPENCLAW_STATE_DIR` (default `/data/.openclaw`). `exit` leaves that zsh and returns to the root `bash`.
-
-Scripts in `bin/` are installed to `/app/bin` and are on `PATH` in the Railway console:
-
-- `cdw` — `cd` to the workspace directory (`OPENCLAW_WORKSPACE_DIR`, falling back to `${OPENCLAW_STATE_DIR:-/data/.openclaw}/workspace`). It is a shell alias, so it changes your current shell's directory.
-- `provider-quota` — remaining quota for every configured model provider, plus a link to add tokens. `provider-quota --json` prints the same report as JSON.
-- `disk-usage` — finds the biggest files and directories under `/data` (or any path) so you know what's safe to delete. `disk-usage --min-size 1G` raises the threshold (default `500M`); `disk-usage --json` prints the same report as JSON.
-- `r2-sync` — the R2 workspace sync job (see below). The entrypoint already runs it in the background when `R2_BUCKET` is set.
-
 ## Sync the workspace with Cloudflare R2 (Obsidian)
 
 Optional. A background job two-way syncs `/data/workspace` (`MEMORY.md`, `memory/`, `AGENTS.md`, skills, ...) with an R2 bucket using `rclone bisync`, so you can edit the markdown in Obsidian. Leave `R2_BUCKET` unset to disable it. `/data/.openclaw` (config, gateway token) is never synced.
