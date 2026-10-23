@@ -31,7 +31,7 @@ open http://localhost:8080/setup  # password: test
 **Key files**:
 - `src/server.js` — wrapper, proxy, gateway lifecycle, config persistence (no inline HTML/CSS)
 - `src/public/` — `setup.html`, `styles.css`, `setup-app.js` (vanilla JS, no build step)
-- `bin/` — console helpers copied to `/app/bin`, on `PATH` (also re-added in `/etc/profile.d/openclaw.sh`).
+- `bin/` — console helpers copied to `/app/bin`, on `PATH` (also re-added in `/home/openclaw/openclaw.sh`).
 - `plugins/ops-tools/` — tool plugin exposing `bin/` scripts as typed agent tools; declarations in `tools.json`, generic runner in `src/index.ts`, built into the image at `/app/plugins/ops-tools`
 - `Dockerfile` — single-stage: installs OpenClaw via npm + wrapper deps
 
@@ -76,4 +76,4 @@ Project is onboarded with Serena (MCP). Before tasks: check `mcp__serena__check_
 9. Config Editor (`/setup/config`) writes `openclaw.json` directly (parse+validate → `.bak-<timestamp>` copy → `fs.writeFileSync` → `restartGateway()`), unlike onboarding's CLI-based writes. Intentional: operator tool for fixing broken config without the CLI.
 10. `/app` is root-owned and not writable (`chmod -R a-w`). The gateway user cannot edit `bin/` or `plugins/ops-tools/tools.json` after deploy, and cannot replace those directories because `/app` itself is not writable. Mutable state stays on `/data`. A config change to `plugins.load.paths` can still load a different plugin from the volume.
 11. Provider plugins (`@openclaw/deepinfra-provider`, `@openclaw/groq-provider`, `@openclaw/perplexity-plugin`) are installed in the image at `/opt/openclaw-plugin-seed`, pinned to the OpenClaw release. An unpinned `plugins install` resolves a newer ClawHub build that this runtime rejects. `entrypoint.sh` copies `npm/projects` onto `$OPENCLAW_STATE_DIR` when `/opt/openclaw-plugin-seed/STAMP` changes. A symlink is not discovered. The volume hides anything the build writes under `/data`.
-12. Railway console is an interactive root shell. `/etc/profile.d/zz-openclaw-console.sh` (also appended to `/etc/bash.bashrc` and `/root/.bashrc`; interactive `sh` reads it via `ENV`) runs `gosu openclaw zsh` with cwd `OPENCLAW_STATE_DIR` (default `/data/.openclaw`). An outer `sh` is replaced with bash first. `exit` returns to that root bash. The zsh sources `/etc/openclaw/zshrc` and `/etc/openclaw/aliases` (copied from `~/projects/startup/aliases`).
+12. Railway console is an interactive root shell. `/etc/profile.d/zz-openclaw-console.sh` (also appended to `/etc/bash.bashrc` and `/root/.bashrc`; interactive `sh` reads it via `ENV`) runs `gosu openclaw zsh` with cwd `OPENCLAW_STATE_DIR` (default `/data/.openclaw`). An outer `sh` is replaced with bash first. `exit` returns to that root bash. The zsh is `/home/openclaw/.zshrc`. It sources `/home/openclaw/openclaw.sh`, `/home/openclaw/git.plugin.zsh`, and `/home/openclaw/.aliases` (copied from `~/projects/startup/aliases`).

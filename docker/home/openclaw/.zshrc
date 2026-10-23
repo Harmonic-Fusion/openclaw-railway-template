@@ -1,9 +1,9 @@
-# Interactive zsh for the openclaw user. The Railway console enters this
-# from /etc/profile.d/zz-openclaw-console.sh. `exit` returns to root bash.
-# `~/.zshrc` sources this file. `resource` (alias below) sources it again.
+# Interactive zsh for the openclaw user. Installed as /home/openclaw/.zshrc.
+# The Railway console enters it from zz-openclaw-console.sh. `exit` returns
+# to root bash. `resource` (alias below) sources this file again.
 
 [ -r /etc/profile.d/container-env.sh ] && . /etc/profile.d/container-env.sh
-[ -r /etc/profile.d/openclaw.sh ] && . /etc/profile.d/openclaw.sh
+[ -r /home/openclaw/openclaw.sh ] && . /home/openclaw/openclaw.sh
 
 if [[ -o interactive ]] && [[ -z ${OPENCLAW_ZSH_INIT:-} ]]; then
   export OPENCLAW_ZSH_INIT=1
@@ -16,7 +16,7 @@ fi
 
 # Oh My Zsh git plugin: gst, gco, and the rest of that alias set.
 # `local` in the plugin is only valid inside a function. compdef is completion.
-if [[ -r /etc/openclaw/git.plugin.zsh ]]; then
+if [[ -r /home/openclaw/git.plugin.zsh ]]; then
   __git_prompt_git() { GIT_OPTIONAL_LOCKS=0 command git "$@"; }
   git_current_branch() {
     local ref
@@ -30,7 +30,7 @@ if [[ -r /etc/openclaw/git.plugin.zsh ]]; then
   }
   _openclaw_load_git_plugin() {
     compdef() { :; }
-    . /etc/openclaw/git.plugin.zsh
+    . /home/openclaw/git.plugin.zsh
   }
   _openclaw_load_git_plugin
   unfunction _openclaw_load_git_plugin compdef
@@ -39,12 +39,12 @@ fi
 # Copied from ~/projects/startup/aliases. `complete` is bash-only, and
 # `unalias` of a name that is not an alias prints an error under zsh.
 # Loaded after the git plugin so gb and gcb stay these functions.
-if [[ -r /etc/openclaw/aliases ]]; then
+if [[ -r /home/openclaw/.aliases ]]; then
   complete() { :; }
   # `command unalias` still calls this function. `builtin` reaches the real one,
   # which is what removes the git plugin's gb and gcb aliases.
   unalias() { builtin unalias "$@" 2>/dev/null || true; }
-  . /etc/openclaw/aliases
+  . /home/openclaw/.aliases
   unfunction complete unalias
 fi
 

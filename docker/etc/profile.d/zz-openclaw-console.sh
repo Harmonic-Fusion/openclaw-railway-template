@@ -43,9 +43,9 @@ if [ -r /etc/profile.d/container-env.sh ]; then
   # shellcheck disable=SC1091
   . /etc/profile.d/container-env.sh
 fi
-if [ -r /etc/profile.d/openclaw.sh ]; then
+if [ -r /home/openclaw/openclaw.sh ]; then
   # shellcheck disable=SC1091
-  . /etc/profile.d/openclaw.sh
+  . /home/openclaw/openclaw.sh
 fi
 
 _openclaw_console_dir=${OPENCLAW_STATE_DIR:-/data/.openclaw}

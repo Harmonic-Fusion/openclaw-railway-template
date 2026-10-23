@@ -79,9 +79,11 @@ RUN cd plugins/ops-tools \
 
 COPY --chmod=644 docker/etc/profile.d/ /etc/profile.d/
 COPY --chmod=644 docker/etc/ssh/ssh_config.d/github.conf /etc/ssh/ssh_config.d/github.conf
-COPY --chmod=644 docker/etc/openclaw/ /etc/openclaw/
 COPY docker/etc/bash.bashrc.d/openclaw.sh /tmp/openclaw-bashrc
+# --chmod=644 applies to directories the copy creates. These directories
+# already exist; restore search permission in case the copy changed it.
 RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc \
+  && chmod 755 /etc/profile.d /etc/ssh/ssh_config.d \
   && printf '\n# Railway console: enter the openclaw zsh. See zz-openclaw-console.sh.\n[ -r /etc/profile.d/zz-openclaw-console.sh ] && . /etc/profile.d/zz-openclaw-console.sh\n' >> /root/.bashrc
 
 # ~/.openclaw and ~/.ssh follow the volume so CLI sessions, the default state
@@ -94,11 +96,6 @@ RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc \
 # Interactive root bash (the Railway console) sources zz-openclaw-console.sh
 # and drops into this user's zsh. `exit` there returns to root bash.
 RUN useradd -m -s /bin/zsh openclaw \
-  && printf '%s\n' \
-    '# Railway console. Config lives in /etc/openclaw/zshrc.' \
-    '[ -r /etc/openclaw/zshrc ] && . /etc/openclaw/zshrc' \
-    > /home/openclaw/.zshrc \
-  && chown openclaw:openclaw /home/openclaw/.zshrc \
   && chown -R root:root /app \
   && chmod -R a-w /app \
   && mkdir -p /data/.openclaw/ssh \
@@ -108,6 +105,17 @@ RUN useradd -m -s /bin/zsh openclaw \
   && ln -sfn /data/.openclaw/ssh /home/openclaw/.ssh \
   && chown -h openclaw:openclaw /home/openclaw/.openclaw /home/openclaw/.ssh \
   && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
+
+# docker/home/openclaw mirrors /home/openclaw. Do not --chmod the copy:
+# that mode is applied to directories too, and 644 is not traversable.
+COPY --chown=openclaw:openclaw docker/home/openclaw/ /home/openclaw/
+RUN chmod 755 /home/openclaw \
+  && chmod 644 \
+    /home/openclaw/.zshrc \
+    /home/openclaw/.aliases \
+    /home/openclaw/openclaw.sh \
+    /home/openclaw/git.plugin.zsh \
+    /home/openclaw/git.plugin.LICENSE
 
 USER openclaw
 RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
