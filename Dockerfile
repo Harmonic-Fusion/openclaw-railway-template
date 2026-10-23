@@ -79,9 +79,14 @@ RUN cd plugins/ops-tools \
 
 COPY --chmod=644 docker/etc/profile.d/ /etc/profile.d/
 COPY --chmod=644 docker/etc/ssh/ssh_config.d/github.conf /etc/ssh/ssh_config.d/github.conf
-COPY --chmod=644 docker/etc/openclaw/ /etc/openclaw/
+COPY docker/etc/openclaw/ /tmp/openclaw-home/
 COPY docker/etc/bash.bashrc.d/openclaw.sh /tmp/openclaw-bashrc
+# --chmod=644 on a COPY that creates a directory leaves that directory
+# without the execute bit, so the openclaw user cannot look up files in it.
+# User login files go in /home/openclaw instead. These /etc directories
+# already exist; restore search permission in case the copy changed it.
 RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc \
+  && chmod 755 /etc/profile.d /etc/ssh/ssh_config.d \
   && printf '\n# Railway console: enter the openclaw zsh. See zz-openclaw-console.sh.\n[ -r /etc/profile.d/zz-openclaw-console.sh ] && . /etc/profile.d/zz-openclaw-console.sh\n' >> /root/.bashrc
 
 # ~/.openclaw and ~/.ssh follow the volume so CLI sessions, the default state
@@ -94,11 +99,12 @@ RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc \
 # Interactive root bash (the Railway console) sources zz-openclaw-console.sh
 # and drops into this user's zsh. `exit` there returns to root bash.
 RUN useradd -m -s /bin/zsh openclaw \
-  && printf '%s\n' \
-    '# Railway console. Config lives in /etc/openclaw/zshrc.' \
-    '[ -r /etc/openclaw/zshrc ] && . /etc/openclaw/zshrc' \
-    > /home/openclaw/.zshrc \
-  && chown openclaw:openclaw /home/openclaw/.zshrc \
+  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/zshrc /home/openclaw/.zshrc \
+  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/openclaw.sh /home/openclaw/openclaw.sh \
+  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/aliases /home/openclaw/.aliases \
+  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/git.plugin.zsh /home/openclaw/git.plugin.zsh \
+  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/git.plugin.LICENSE /home/openclaw/git.plugin.LICENSE \
+  && rm -rf /tmp/openclaw-home \
   && chown -R root:root /app \
   && chmod -R a-w /app \
   && mkdir -p /data/.openclaw/ssh \
