@@ -1,7 +1,8 @@
-# Login shells (`su -`) start with a clean environment. The entrypoint saves the
-# container environment to /run/container.env; /proc/1/environ is root-only.
-# Interactive non-login bash sources this file from /etc/bash.bashrc.
-if [ -z "${BASH_VERSION:-}" ]; then
+# Login shells (`su -`, login zsh) start with a clean environment. The
+# entrypoint saves the container environment to /run/container.env;
+# /proc/1/environ is root-only. Interactive non-login bash sources this
+# file from /etc/bash.bashrc. The openclaw zsh sources it too.
+if [ -z "${BASH_VERSION:-}" ] && [ -z "${ZSH_VERSION:-}" ]; then
   return 0
 fi
 

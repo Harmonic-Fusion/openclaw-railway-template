@@ -1,0 +1,350 @@
+#!/bin/bash
+
+# The bashrc is a file that the bash shell looks for upon start up in the location ~/.bashrc 
+# It is a file which is run right upon creating a new instance of the shell.
+# Both tcsh and csh shells have similar files (~/.tcshrc and ~/.cshrc respectively)
+# tcsh and csh have syntax differences from bashrc which should be looked up
+
+
+# ---------------------------------------------------------------------------- #
+# Modify Builtin Commands
+# ---------------------------------------------------------------------------- #
+
+# alias cp='cp -i'
+# alias mv='mv -i'
+# alias rm='/bin/rm -i'
+# alias srm='srm -i'
+alias type='type -a'
+
+# ---------------------------------------------------------------------------- #
+# Convenience Aliases
+# ---------------------------------------------------------------------------- #
+
+alias resource='source ~/.zshrc'
+alias allenv='env | sort | less'
+alias chmodinfo='echo -e "chmod information:\n 7 = full (111) \n 6 = read/write (110)\n 5 = read/exec (101)\n 4 = read (100)\n 3 = write/exec (011)\n 2 = write (010)\n 1 = exec (001)\n 0 = none (000)\n \n SHELL$ chmod 754 foo.txt\n  ^= gives user (u) full, group (g) read/exec,  and  others (o) read only"'
+alias lsl='ls -haltr'  # -halter  the -e is part of the -l
+alias lss='ls -hsl'
+
+mkcursor () {
+
+    help="
+Usage: mkcursor <directory>
+Helper for \`mkdir -p <directory> && cursor <directory>\`
+"
+    help_decorator ${help} $@ && return
+    # ------------------------------- #
+    mkdir -p $1
+    cursor $1
+}
+
+
+help_decorator () {
+    # This decorator is meant to help simple functions with documentation
+    # 
+    # Example:
+    # ```
+    # hello () {
+    #     help="
+    # Usage: hello
+    # Simple utility function
+    # "
+    #     help_decorator ${help} $@ && return
+    #     echo "world"
+    # }
+    # ```
+    # 
+    # the help_decorator will return 1 if no help is called for otherwise
+    # returns 0 and then causes the return function to be called exiting the 
+    # function
+
+
+    # get help text from first argument
+    help_text=${1:-'Usage:...'}
+
+    # skip first argument 
+    shift
+
+    # check for help string
+    while getopts ':h' flag; do
+    case "${flag}" in
+        h)
+            echo ${help_text}
+            return 0
+            ;;
+        *)
+            echo "Unknown flag: -${flag}"
+            echo ${help_text}
+            return 0
+            ;;
+    esac
+    done
+    return 1
+}
+
+
+dus () {
+    help="
+Usage: dus [files or dirs]
+Helper for \` du -csh -- ... | sort -h\`
+Defaults to all files in \$PWD including hidden; pass paths (@) to override.
+"
+    help_decorator ${help} $@ && return
+    # ------------------------------- #
+    if (( $# )); then
+        _duspath=("$@")
+    else
+        # *(D) includes hidden files; still excludes . and ..
+        setopt local_options null_glob
+        _duspath=(*(D))
+    fi
+    echo "% du -csh -- ${_duspath[@]} | sort -h"
+    du -csh -- "${_duspath[@]}" | sort -h
+}
+
+
+tarx () {
+    help="
+Usage: tarx FILE.tar.gz
+Helper for \`tar -xvzf <file>\`
+"
+    help_decorator ${help} $@ && return
+    # ------------------------------- #
+    out="extracted__$1"
+    mkdir $out
+    mv $1 $out
+    cd $out
+    tar -xzvf $1
+    cd ..
+    mv $out/$1 .
+    echo mv $out/* .
+}
+
+
+tarc () {
+    help="
+Usage: tarc <directory>
+Helper for \`tar -czvf <dest> <src>\`
+"
+    help_decorator ${help} $@ && return
+    # ------------------------------- #
+    src=${1%/}
+    dest=${src}.tar.gz
+    tar -zcvf $dest $src
+}
+
+
+historycopy () {
+    help="
+Usage: historycopy [-n number]
+
+    -n          number of recent history comands to copy
+    -h          this help text
+
+Copy recent history to clipboard"
+
+    # based on https://google.github.io/styleguide/shellguide.html
+    num_lines=1
+    while getopts 'n:h' flag; do
+    case "${flag}" in
+        n) num_lines="${OPTARG}" ;;
+        h)
+            echo ${help}
+            return 0 ;;
+        *)
+            echo ${help}
+            return 1 ;;
+    esac
+    done
+
+    history | tail -n ${num_lines} | python -c '
+import sys
+for line in sys.stdin:
+    parts = line.split()
+    sys.stdout.write(" ".join(parts[1:]) + "\n")
+' | pbcopy
+}
+
+# --------------------------------------------------------------------------- #
+# Browsers
+# --------------------------------------------------------------------------- #
+
+alias firefox="open -a /Applications/Firefox.app/"
+alias chrome="open -a /Applications/Chrome.app/"
+
+# --------------------------------------------------------------------------- #
+# Docker
+# --------------------------------------------------------------------------- #
+
+alias dc='docker-compose'
+alias dm='docker-machine'
+alias doc='docker'
+
+# --------------------------------------------------------------------------- #
+# Git 
+#----------------------------------------------------------------------------- #
+
+alias grr='git reset HEAD~1'
+alias gac='gitaddcommit'
+alias gda='gitdiffadd'
+alias gus='git restore --staged'
+alias wip='git commit -am "WIP"'
+
+unalias gcb || true
+function gcb {
+    git checkout -b $1 2> /dev/null || git checkout $1
+}
+function _complete_gcb {
+    local cur prev opts
+    git for-each-ref --format="%(refname:strip=2)" "refs/heads/$cur*" "refs/heads/$cur*/**"    
+}
+complete -F _complete_gcb gcb
+
+
+unalias gb || true
+function gb {
+    if [[ "${@}" == "" ]]
+    then
+        git branch --sort=-committerdate | cat
+    else
+        git branch $@
+    fi
+}
+# function _complete_gb {
+#     local cur prev opts
+#     git branch completion
+# }
+# complete -F _complete_gb gb
+
+
+# --------------------------------------------------------------------------- #
+# Extension CLI
+#----------------------------------------------------------------------------- #
+
+s () {
+    help="
+Usage: s [question]
+Wrapper for github copilot suggest
+"
+    help_decorator ${help} $@ && return
+    # ------------------------------- #
+    gh copilot suggest --shell-out=/bin/sh --target=shell "$@"
+
+    # oh_my_zsh_custom_extension_path="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins"
+    # zsh_github_copilot_rc="${oh_my_zsh_custom_extension_path}/zsh-github-copilot/zsh-github-copilot.plugin.zsh"
+    # if [ -f $zsh_github_copilot_rc ]
+    # then
+    #     source $zsh_github_copilot_rc
+    #     result="$(_gh_copilot_suggest "$@")"
+    #     [ -z "$result" ] && _prompt_msg "# No suggestion found" && return 1
+    #     echo $result
+    #     # write the result to the command line prompt for the next line
+    #     echo $result | pbcopy
+    # else
+    #     # Fall back command
+    #     gh copilot suggest --shell-out=/bin/sh --target=shell "$@"
+    # fi
+}
+
+
+# --------------------------------------------------------------------------- #
+# Linux
+# --------------------------------------------------------------------------- #
+
+alias apt-get="sudo apt-get"
+
+# --------------------------------------------------------------------------- #
+# OSX
+# --------------------------------------------------------------------------- #
+
+alias reset_bluetooth_osx="sudo kextunload -b com.apple.iokit.BroadcomBluetoothHostControllerUSBTransport && sudo kextload -b com.apple.iokit.BroadcomBluetoothHostControllerUSBTransport"
+alias symbols_mac_ref="open /Users/dylangregersen/developer/documents/Apple\ Keyboard\ Symbols.pdf"
+
+alias beepoff='xset b off'
+alias nobeep='xset b off'
+alias beepon='xset b on'
+alias yesbeep='xset b on'
+
+alias lock='/System/Library/CoreServices/"Menu Extras"/User.menu/Contents/Resources/CGSession -suspend'
+
+alias finder='open .'
+
+alias finder_show_hidden='defaults write com.apple.Finder AppleShowAllFiles TRUE'
+alias finder_hide_hidden='defaults write com.apple.Finder AppleShowAllFiles FALSE'
+
+
+# --------------------------------------------------------------------------- #
+# Python 
+# --------------------------------------------------------------------------- # 
+
+alias py="python"
+alias ipy="ipython"
+alias ipyn='jupyter lab'
+
+# --------------------------------------------------------------------------- #
+# Text Editors
+# --------------------------------------------------------------------------- #
+
+alias nice_try="echo 'Ya, nice try. Turn around.' && sleep 1 && lock"
+
+alias em='/usr/bin/emacs'
+alias edit="subl"
+alias editn='edit --new-window'
+alias nedit='edit --new-window'
+alias spy="spyder"
+
+# --------------------------------------------------------------------------- #
+# Kubernetes
+#----------------------------------------------------------------------------- #
+
+# if [ "$(kubectl get namespaces | grep misc)" = "" ]
+# then
+#     kubectl create namespace misc
+#     kubectl config set-context --current --namespace=misc
+# fi
+alias k='kubectl'
+# command -v kubectl > /dev/null && source <(kubectl completion $(basename $SHELL))
+# command -v helm > /dev/null && source <(helm completion $(basename $SHELL))
+
+# --------------------------------------------------------------------------- #
+# Misc.
+#----------------------------------------------------------------------------- #
+
+alias y='echo YES!'
+alias n='echo NO!'
+alias textwars='telnet towel.blinkenlights.nl'
+alias sl="ls | rev"
+
+matrix () {
+    # alias matrix='LC_ALL=C tr -c "[:digit:]" " " < /dev/urandom | dd cbs=$COLUMNS conv=unblock | GREP_COLOR="1;32" grep --color "[^ ]"'
+    echo "\033[2J\033[?25l"
+    R=`tput lines`
+    C=`tput cols`
+    #: $[R--]
+    while true 
+    do 
+            # e=echo\ -e s=sleep j=$[RANDOM%C] d=$[RANDOM%R];
+            e=echo
+            s=sleep
+            j=$[RANDOM%C]
+            d=$[RANDOM%R]
+            for i in `eval $e {1..$R}`
+            do 
+                c=`printf '\\\\0%o' $[RANDOM%57+33]` ### http://bruxy.regnet.cz/web/linux ###
+                $e "\033[$[i-1];${j}H\033[32m$c\033[$i;${j}H\033[37m"$c
+                $s 0.1
+                if  [ $i -ge $d ]
+                then 
+                    $e "\033[$[i-d];${j}H "
+                fi
+            done
+            for i in `eval $e {$[i-d]..$R}` #[mat!rix]
+            do 
+                echo -e "\033[$i;${j}f "
+                $s 0.1
+            done
+        sleep 0.1
+    done #(c) 2011 -- [ BruXy ]
+}
+
+

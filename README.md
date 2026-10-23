@@ -64,6 +64,8 @@ docker run --rm -p 8080:8080 \
 
 ## Console helpers
 
+A new Railway console starts as root `bash`, which immediately enters the `openclaw` user with `zsh` in `OPENCLAW_STATE_DIR` (default `/data/.openclaw`). `exit` leaves that zsh and returns to the root `bash`.
+
 Scripts in `bin/` are installed to `/app/bin` and are on `PATH` in the Railway console:
 
 - `cdw` — `cd` to the workspace directory (`OPENCLAW_WORKSPACE_DIR`, falling back to `${OPENCLAW_STATE_DIR:-/data/.openclaw}/workspace`). It is a shell alias, so it changes your current shell's directory.

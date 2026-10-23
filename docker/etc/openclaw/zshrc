@@ -1,0 +1,27 @@
+# Interactive zsh for the openclaw user. The Railway console enters this
+# from /etc/profile.d/zz-openclaw-console.sh. `exit` returns to root bash.
+# `~/.zshrc` sources this file. `resource` (alias below) sources it again.
+
+[ -r /etc/profile.d/container-env.sh ] && . /etc/profile.d/container-env.sh
+[ -r /etc/profile.d/openclaw.sh ] && . /etc/profile.d/openclaw.sh
+
+# `%` is zsh, `#` is the root bash you get after `exit`.
+PS1='%n:%~%# '
+
+if [[ -o interactive ]] && [[ -z ${OPENCLAW_ZSH_INIT:-} ]]; then
+  export OPENCLAW_ZSH_INIT=1
+  _openclaw_state_dir=${OPENCLAW_STATE_DIR:-/data/.openclaw}
+  if [[ -d "$_openclaw_state_dir" ]]; then
+    cd -- "$_openclaw_state_dir" || true
+  fi
+  unset _openclaw_state_dir
+fi
+
+# Copied from ~/projects/startup/aliases. `complete` is bash-only, and
+# `unalias` of a name that is not an alias prints an error under zsh.
+if [[ -r /etc/openclaw/aliases ]]; then
+  complete() { :; }
+  unalias() { command unalias "$@" 2>/dev/null || true; }
+  . /etc/openclaw/aliases
+  unfunction complete unalias
+fi

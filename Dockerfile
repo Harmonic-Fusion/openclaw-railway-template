@@ -15,6 +15,7 @@ RUN apt-get update \
     build-essential \
     zip \
     unzip \
+    zsh \
   && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g \
@@ -57,8 +58,10 @@ RUN cd plugins/ops-tools \
 
 COPY --chmod=644 docker/etc/profile.d/ /etc/profile.d/
 COPY --chmod=644 docker/etc/ssh/ssh_config.d/github.conf /etc/ssh/ssh_config.d/github.conf
+COPY --chmod=644 docker/etc/openclaw/ /etc/openclaw/
 COPY docker/etc/bash.bashrc.d/openclaw.sh /tmp/openclaw-bashrc
-RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc
+RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc \
+  && printf '\n# Railway console: enter the openclaw zsh. See zz-openclaw-console.sh.\n[ -r /etc/profile.d/zz-openclaw-console.sh ] && . /etc/profile.d/zz-openclaw-console.sh\n' >> /root/.bashrc
 
 # ~/.openclaw and ~/.ssh follow the volume so CLI sessions, the default state
 # dir, and the GitHub key pair share one persistent directory. The mount hides
@@ -67,7 +70,14 @@ RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc
 # /app stays root-owned and not writable. Removing write on bin/ and plugins/
 # alone is not enough: deleting or replacing those directories only needs write
 # permission on /app. The wrapper only writes under /data.
-RUN useradd -m -s /bin/bash openclaw \
+# Interactive root bash (the Railway console) sources zz-openclaw-console.sh
+# and drops into this user's zsh. `exit` there returns to root bash.
+RUN useradd -m -s /bin/zsh openclaw \
+  && printf '%s\n' \
+    '# Railway console. Config lives in /etc/openclaw/zshrc.' \
+    '[ -r /etc/openclaw/zshrc ] && . /etc/openclaw/zshrc' \
+    > /home/openclaw/.zshrc \
+  && chown openclaw:openclaw /home/openclaw/.zshrc \
   && chown -R root:root /app \
   && chmod -R a-w /app \
   && mkdir -p /data/.openclaw/ssh \
@@ -85,6 +95,10 @@ ENV PATH="/app/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbi
 ENV HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
 ENV HOMEBREW_CELLAR="/home/linuxbrew/.linuxbrew/Cellar"
 ENV HOMEBREW_REPOSITORY="/home/linuxbrew/.linuxbrew/Homebrew"
+
+# Interactive sh reads $ENV. The console script turns that sh into bash,
+# then enters the openclaw zsh. Non-interactive sh ignores it.
+ENV ENV=/etc/profile.d/zz-openclaw-console.sh
 
 ENV PORT=8080
 ENV OPENCLAW_ENTRY=/usr/local/lib/node_modules/openclaw/dist/entry.js
