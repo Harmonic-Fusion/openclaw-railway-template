@@ -79,11 +79,8 @@ RUN cd plugins/ops-tools \
 
 COPY --chmod=644 docker/etc/profile.d/ /etc/profile.d/
 COPY --chmod=644 docker/etc/ssh/ssh_config.d/github.conf /etc/ssh/ssh_config.d/github.conf
-COPY docker/etc/openclaw/ /tmp/openclaw-home/
 COPY docker/etc/bash.bashrc.d/openclaw.sh /tmp/openclaw-bashrc
-# --chmod=644 on a COPY that creates a directory leaves that directory
-# without the execute bit, so the openclaw user cannot look up files in it.
-# User login files go in /home/openclaw instead. These /etc directories
+# --chmod=644 applies to directories the copy creates. These directories
 # already exist; restore search permission in case the copy changed it.
 RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc \
   && chmod 755 /etc/profile.d /etc/ssh/ssh_config.d \
@@ -99,12 +96,6 @@ RUN cat /tmp/openclaw-bashrc >> /etc/bash.bashrc && rm /tmp/openclaw-bashrc \
 # Interactive root bash (the Railway console) sources zz-openclaw-console.sh
 # and drops into this user's zsh. `exit` there returns to root bash.
 RUN useradd -m -s /bin/zsh openclaw \
-  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/zshrc /home/openclaw/.zshrc \
-  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/openclaw.sh /home/openclaw/openclaw.sh \
-  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/aliases /home/openclaw/.aliases \
-  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/git.plugin.zsh /home/openclaw/git.plugin.zsh \
-  && install -o openclaw -g openclaw -m 644 /tmp/openclaw-home/git.plugin.LICENSE /home/openclaw/git.plugin.LICENSE \
-  && rm -rf /tmp/openclaw-home \
   && chown -R root:root /app \
   && chmod -R a-w /app \
   && mkdir -p /data/.openclaw/ssh \
@@ -114,6 +105,17 @@ RUN useradd -m -s /bin/zsh openclaw \
   && ln -sfn /data/.openclaw/ssh /home/openclaw/.ssh \
   && chown -h openclaw:openclaw /home/openclaw/.openclaw /home/openclaw/.ssh \
   && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
+
+# docker/home/openclaw mirrors /home/openclaw. Do not --chmod the copy:
+# that mode is applied to directories too, and 644 is not traversable.
+COPY --chown=openclaw:openclaw docker/home/openclaw/ /home/openclaw/
+RUN chmod 755 /home/openclaw \
+  && chmod 644 \
+    /home/openclaw/.zshrc \
+    /home/openclaw/.aliases \
+    /home/openclaw/openclaw.sh \
+    /home/openclaw/git.plugin.zsh \
+    /home/openclaw/git.plugin.LICENSE
 
 USER openclaw
 RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
