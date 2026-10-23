@@ -75,6 +75,22 @@
       "command": "update-models",
       "optional": true,
       "result": { "format": "text" }
+    },
+    {
+      "name": "ops_r2_sync",
+      "label": "R2 Sync",
+      "description": "Sync the OpenClaw workspace with the Cloudflare R2 bucket. push makes R2 match the workspace, including deletes. pull makes the workspace match R2, including deletes. resync merges both sides and the newest file wins. Changes files on both sides.",
+      "command": "r2-sync",
+      "optional": true,
+      "result": { "format": "text" },
+      "parameters": {
+        "command": {
+          "type": "string",
+          "positional": true,
+          "required": true,
+          "description": "push, pull, or resync."
+        }
+      }
     }
   ]
 }

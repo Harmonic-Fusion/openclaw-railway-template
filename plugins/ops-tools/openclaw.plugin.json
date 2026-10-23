@@ -27,11 +27,15 @@
       "ops_disk_usage",
       "ops_quotas",
       "ops_session_info",
-      "ops_update_models"
+      "ops_update_models",
+      "ops_r2_sync"
     ]
   },
   "toolMetadata": {
     "ops_update_models": {
+      "optional": true
+    },
+    "ops_r2_sync": {
       "optional": true
     }
   }
